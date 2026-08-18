@@ -9,7 +9,8 @@ exit /b %ERRORLEVEL%
 #  WoW Classic Era - AddOns one-click deployment script
 #  - Downloads all CurseForge addons listed below (latest Classic Era file)
 #  - Copies the *-SoD addons from the local git workspace (GitHub fallback)
-#  - Extracts everything into the directory where THIS script lives
+#  - Extracts everything into the 'Addons' subfolder next to THIS script
+#    (put this script into the 'Interface' folder and run it there)
 #  - Deletes all downloaded zip files when finished
 #  Notes:
 #  - Metadata lookups use the official CurseForge Core API
@@ -29,6 +30,7 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 
 $Self      = $env:DEPLOY_SELF
 $ScriptDir = ($env:DEPLOY_DIR).TrimEnd('\')
+$DeployDir  = Join-Path $ScriptDir 'Addons'
 
 # ----------------------------- configuration --------------------------------
 $Ua          = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
@@ -257,13 +259,15 @@ Write-Host ''
 Write-Host '================================================================' -ForegroundColor Cyan
 Write-Host '   World of Warcraft Classic Era - AddOns one-click deploy'      -ForegroundColor Cyan
 Write-Host '================================================================' -ForegroundColor Cyan
-Write-Host ('  Target directory : ' + $ScriptDir)
+Write-Host ('  Target directory : ' + $DeployDir)
 Write-Host ('  CurseForge addons: ' + $Projects.Count + ' projects')
 Write-Host ('  Own SoD addons   : ' + $SodRepos.Count + ' repositories')
 Write-Host ('  External (skip)  : ' + ($External -join ', '))
 Write-Host ''
 
-if(-not (Test-Writable $ScriptDir)){
+$checkDir = $ScriptDir
+if(Test-Path -LiteralPath $DeployDir){ $checkDir = $DeployDir }
+if(-not (Test-Writable $checkDir)){
   $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = New-Object Security.Principal.WindowsPrincipal($identity)
   if($principal.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)){
@@ -275,6 +279,7 @@ if(-not (Test-Writable $ScriptDir)){
   Start-Process -FilePath $Self -Verb RunAs | Out-Null
   exit 0
 }
+New-Item -ItemType Directory -Force -Path $DeployDir | Out-Null
 
 $wow = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '^Wow' })
 if($wow.Count -gt 0){
@@ -520,7 +525,7 @@ foreach($r in $zips){
     $tops = @(Get-ChildItem -LiteralPath $stage -Directory)
     if($tops.Count -eq 0){ throw 'zip contains no addon folder' }
     foreach($d in $tops){
-      $target = Join-Path $ScriptDir $d.Name
+      $target = Join-Path $DeployDir $d.Name
       if(Test-Path -LiteralPath $target){ Remove-Item -LiteralPath $target -Recurse -Force }
       Move-Item -LiteralPath $d.FullName -Destination $target -Force
     }
@@ -541,7 +546,7 @@ $i = 0
 foreach($s in $SodRepos){
   $i++
   Show-Bar ($i / $SodRepos.Count) ('deploying ' + $s.Folder + ' (' + $i + '/' + $SodRepos.Count + ')')
-  $target = Join-Path $ScriptDir $s.Folder
+  $target = Join-Path $DeployDir $s.Folder
   $src    = Join-Path $RepoRoot $s.Repo
   $done   = $false
   if(Test-Path -LiteralPath $src){
