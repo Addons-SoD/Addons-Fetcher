@@ -126,8 +126,9 @@ $SodRepos = @(
 )
 
 # ------------------------------- helpers ------------------------------------
-# Console width is kept at 120 columns; long lines are truncated with '...'.
-$ConWidth = 120
+# Console width is kept at 80 columns (best compatibility); long lines are
+# truncated with '...'.
+$ConWidth = 80
 $HLine = '=' * $ConWidth
 
 function Truncate-Text([string]$s,[int]$maxLen){
@@ -153,7 +154,7 @@ function Wait-Spin([int]$sec,[string]$msg){
     Start-Sleep -Milliseconds 200
     Write-Host ("`r  " + (Get-SpinChar) + " " + $msg + " (" + [int](($w + 1) / 5) + "s/" + $sec + "s)  ") -NoNewline
   }
-  Write-Host ("`r" + (' ' * 120)) -NoNewline
+  Write-Host ("`r" + (' ' * $ConWidth)) -NoNewline
   Write-Host ''
 }
 
@@ -169,7 +170,7 @@ function Test-Writable($dir){
 function Show-Bar($ratio,$text){
   if($ratio -lt 0){ $ratio = 0 }
   if($ratio -gt 1){ $ratio = 1 }
-  $w = 30
+  $w = 20
   $f = [int]([Math]::Round($w * $ratio))
   $bar = ([string][char]0x2588) * $f + ([string][char]0x2591) * ($w - $f)
   $line = "`r " + (Get-SpinChar) + " [" + $bar + "] " + ("{0,3}" -f [int]($ratio*100)) + "%  " + $text
@@ -483,7 +484,7 @@ New-Item -ItemType Directory -Force -Path $DeployDir | Out-Null
 
 $wow = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '^Wow' })
 if($wow.Count -gt 0){
-  Write-Host '  WARNING: World of Warcraft appears to be running. Files in use may fail to update.' -ForegroundColor Yellow
+  Write-Host (Truncate-Text '  WARNING: World of Warcraft appears to be running. Files in use may fail to update.' $ConWidth) -ForegroundColor Yellow
   Write-Host '           It is recommended to close the game first.' -ForegroundColor Yellow
 }
 
@@ -865,11 +866,14 @@ while($queue.Count -gt 0 -or $active.Count -gt 0){
     $it = $queue.Dequeue()
     $curlArgs = @('-s','-L','--fail','--retry','2','--retry-delay','3','--connect-timeout','30','--max-time','7200','-A',$Ua,'-o',$it.ZipPath) + (Get-NextChannelArgs) + @($it.DlUrl)
     $proc = Start-CurlProc $curlArgs $null
-    $active[$it.ZipPath] = @{ Proc = $proc; Item = $it; Start = Get-Date }
+    $active[$it.ZipPath] = @{ Proc = $proc; Item = $it; Start = Get-Date; LastSize = [long]0; LastT = Get-Date }
     if($queue.Count -gt 0){ Start-Sleep -Milliseconds (Get-Random -Minimum 50 -Maximum 150) }
   }
   Start-Sleep -Milliseconds 400
   # Slow-download guard: kill stalled transfers and retry on another channel.
+  # The check uses the RECENT increment (bytes since the last poll), not the
+  # lifetime average - a file that started fast and then stalled would fool
+  # an average-based check.
   foreach($key in @($active.Keys)){
     $a = $active[$key]
     if(-not $a.Proc.HasExited){
@@ -877,8 +881,12 @@ while($queue.Count -gt 0 -or $active.Count -gt 0){
       if($elapsed -gt $SlowCheckSec){
         $sz = [long]0
         if(Test-Path -LiteralPath $key){ $sz = (Get-Item -LiteralPath $key).Length }
-        $avg = $sz / $elapsed
-        if($avg -lt $MinDlSpeed){
+        $dt = ((Get-Date) - $a.LastT).TotalSeconds
+        if($dt -ge 3){
+          $inst = ($sz - $a.LastSize) / $dt
+          $a.LastSize = $sz
+          $a.LastT = Get-Date
+          if($inst -lt $MinDlSpeed){
           $slowKills++
           # Silent restart: the item goes back into the queue on another
           # channel; the progress bar keeps running untouched.
@@ -939,6 +947,7 @@ while($queue.Count -gt 0 -or $active.Count -gt 0){
       }
     }
   }
+  }
   foreach($key in @($active.Keys)){
     $a = $active[$key]
     if($a.Proc.HasExited){
@@ -992,7 +1001,8 @@ while($queue.Count -gt 0 -or $active.Count -gt 0){
   }
   $spdTxt = '--'
   if($emaSpeed -gt 0){ $spdTxt = ('{0:N1} MB/s' -f ($emaSpeed / 1MB)) }
-  Show-Bar $ratio ('downloading ' + $mbDone + '/' + $mbAll + ' MB @ ' + $spdTxt + ' | done ' + $doneCount + '/' + ($doneCount + $remain) + ' | pending ' + $remain)
+  $barTxt = '{0}/{1}MB @ {2} | {3}/{4} | pend {5}' -f $mbDone, $mbAll, $spdTxt, $doneCount, ($doneCount + $remain), $remain
+  Show-Bar $ratio $barTxt
 }
 Finish-Line
 
