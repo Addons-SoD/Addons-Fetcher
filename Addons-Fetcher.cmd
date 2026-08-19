@@ -118,6 +118,7 @@ $Projects = @(
 $SodRepos = @(
   @{ Repo = 'BFGadgets-SoD';        Folder = 'BFGadgets'       },
   @{ Repo = 'BiaoGe-SoD';           Folder = 'BiaoGe'          },
+  @{ Repo = 'bloodOfHeros-SoD';     Folder = 'bloodOfHeros'    },
   @{ Repo = 'RepairHelper-SoD';     Folder = 'RepairHelper'    },
   @{ Repo = 'SellerHelper-SoD';     Folder = 'SellerHelper'    },
   @{ Repo = 'TheBurningTrade-SoD';  Folder = 'TheBurningTrade' },
@@ -125,7 +126,7 @@ $SodRepos = @(
 )
 
 # Not from CurseForge - left untouched on disk
-$External = @('bloodOfHeros','MYStats')
+$External = @('MYStats')
 # ------------------------------- helpers ------------------------------------
 function Test-Writable($dir){
   try{
