@@ -131,6 +131,62 @@ $SodRepos = @(
 $ConWidth = 80
 $HLine = '=' * $ConWidth
 
+# Disable QuickEdit (clicking the console pauses the script in select mode)
+# and hide the cursor while running.
+function Init-ConsoleMode{
+  try{
+    if(-not ('AddonsConsoleHelper' -as [type])){
+      $src = @'
+using System;
+using System.Runtime.InteropServices;
+public static class AddonsConsoleHelper {
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern IntPtr GetStdHandle(int nStdHandle);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern bool SetConsoleCursorInfo(IntPtr hConsoleOutput, ref CONSOLE_CURSOR_INFO lpConsoleCursorInfo);
+  [StructLayout(LayoutKind.Sequential)]
+  public struct CONSOLE_CURSOR_INFO { public uint dwSize; public bool bVisible; }
+}
+'@
+      Add-Type -TypeDefinition $src
+    }
+    $in  = [AddonsConsoleHelper]::GetStdHandle(-10)
+    $out = [AddonsConsoleHelper]::GetStdHandle(-11)
+    $mode = [uint32]0
+    if([AddonsConsoleHelper]::GetConsoleMode($in, [ref]$mode)){
+      $mode = $mode -band (-bnot 0x0040) -band (-bnot 0x0020)
+      [void][AddonsConsoleHelper]::SetConsoleMode($in, $mode)
+    }
+    $cci = New-Object AddonsConsoleHelper+CONSOLE_CURSOR_INFO
+    $cci.dwSize = 1
+    $cci.bVisible = $false
+    [void][AddonsConsoleHelper]::SetConsoleCursorInfo($out, [ref]$cci)
+  }catch{}
+}
+
+# Restore QuickEdit + the cursor before exiting (also before Read-Host).
+function Restore-ConsoleMode{
+  try{
+    if(('AddonsConsoleHelper' -as [type])){
+      $in  = [AddonsConsoleHelper]::GetStdHandle(-10)
+      $out = [AddonsConsoleHelper]::GetStdHandle(-11)
+      $mode = [uint32]0
+      if([AddonsConsoleHelper]::GetConsoleMode($in, [ref]$mode)){
+        $mode = $mode -bor 0x0040 -bor 0x0020
+        [void][AddonsConsoleHelper]::SetConsoleMode($in, $mode)
+      }
+      $cci = New-Object AddonsConsoleHelper+CONSOLE_CURSOR_INFO
+      $cci.dwSize = 20
+      $cci.bVisible = $true
+      [void][AddonsConsoleHelper]::SetConsoleCursorInfo($out, [ref]$cci)
+    }
+  }catch{}
+}
+
 function Truncate-Text([string]$s,[int]$maxLen){
   if($s.Length -gt $maxLen){
     if($maxLen -le 3){ return $s.Substring(0, [Math]::Min($maxLen, $s.Length)) }
@@ -457,6 +513,7 @@ function Invoke-CurlDownload($url,$outFile,$timeoutSec,[string[]]$extraArgs){
 }
 
 # ------------------------------ pre-checks ----------------------------------
+Init-ConsoleMode
 Write-Host ''
 Write-Host $HLine -ForegroundColor Cyan
 Write-Host ('   World of Warcraft Classic Era - AddOns one-click deploy') -ForegroundColor Cyan
@@ -473,10 +530,12 @@ if(-not (Test-Writable $checkDir)){
   $principal = New-Object Security.Principal.WindowsPrincipal($identity)
   if($principal.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)){
     Write-Host '  ERROR: target directory is not writable even as administrator.' -ForegroundColor Red
+    Restore-ConsoleMode
     Read-Host '  Press Enter to exit' | Out-Null
     exit 1
   }
   Write-Host '  Target directory needs administrator permission - requesting elevation...' -ForegroundColor Yellow
+  Restore-ConsoleMode
   Start-Process -FilePath $Self -Verb RunAs | Out-Null
   exit 0
 }
@@ -1242,4 +1301,5 @@ if($sodFail.Count -gt 0){
 }
 Write-Host '  Downloaded zip files have been removed.' -ForegroundColor Gray
 Write-Host ''
+Restore-ConsoleMode
 Read-Host '  Press Enter to exit' | Out-Null
