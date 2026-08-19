@@ -6,23 +6,28 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$env:DEPLOY_SELF='%~
 exit /b %ERRORLEVEL%
 #PSSTART
 # ============================================================================
-#  WoW Classic Era - AddOns one-click deployment script
+#  WoW Classic Era - AddOns one-click deployment script  (v2 - fast channel)
 #  - Downloads all CurseForge addons listed below (latest Classic Era file)
 #  - Copies the *-SoD addons from the local git workspace (GitHub fallback)
 #  - Extracts everything into the 'Addons' subfolder next to THIS script
 #    (put this script into the 'Interface' folder and run it there)
 #  - Deletes all downloaded zip files when finished
+#  v2 changes:
+#  * Smart channel selection: detects the Windows system proxy, enumerates
+#    multiple CDN IPs (system DNS + AliDNS), speed-tests every candidate in
+#    parallel and uses the fastest one. No proxy required - a proxy is only
+#    used when the system has one AND it proves faster than direct links.
+#    The chosen channel is cached for 30 minutes ('.addons-fetcher-cache.json'
+#    next to this script).
+#  * Phase 1 metadata lookups run in parallel (x8 curl processes).
+#  * Extraction uses tar.exe with 4 parallel workers (fallback: Expand-Archive).
 #  Notes:
 #  - Metadata lookups use the official CurseForge Core API
 #    (api.curseforge.com) with the API key of the locally installed
-#    CurseForge app. This endpoint is fast and not behind Cloudflare.
+#    CurseForge app.
 #  - If the Core API is unavailable, the script falls back to scraping
-#    www.curseforge.com with the Windows native Schannel HTTP stack,
-#    which passes Cloudflare far more reliably than curl. When
-#    Cloudflare starts challenging, the script goes silent for several
-#    minutes and then retries the failed items.
-#  - Bulk downloads go straight to the ForgeCDN mirror, which is not
-#    challenge-protected.
+#    www.curseforge.com with the Windows native Schannel HTTP stack.
+#  - Bulk downloads go straight to the ForgeCDN mirror.
 # ============================================================================
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
@@ -31,6 +36,8 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 $Self      = $env:DEPLOY_SELF
 $ScriptDir = ($env:DEPLOY_DIR).TrimEnd('\')
 $DeployDir  = Join-Path $ScriptDir 'Addons'
+$CacheFile = Join-Path $ScriptDir '.addons-fetcher-cache.json'
+$CacheTtl  = 1800
 
 # ----------------------------- configuration --------------------------------
 $Ua          = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
@@ -40,8 +47,9 @@ $CoreBase    = 'https://api.curseforge.com/v1'
 $CfApiKey    = '$2a$10$bL4bIL5pUWqfcO7KQtnMReakwtfHbNKh6v1uTpKlzhwoueEJQnPnm'
 $RepoRoot    = (Join-Path $env:USERPROFILE 'WorkSpace\Github')
 $GhUser      = 'Addons-SoD'
-$Concurrency = 3
-$SilenceSec  = 420
+$Concurrency = 8
+$SilenceSec   = 180
+$CdnSilenceSec = 60
 $CdnToken    = '267C6CA3'
 
 $CfHeaders = @{
@@ -138,6 +146,136 @@ function Get-StatusCode($err){
   return 0
 }
 
+# Build a single command line for Start-Process (quotes args containing spaces).
+function Get-CurlArgLine([string[]]$argArr){
+  return (($argArr | ForEach-Object { if([string]$_ -match '[ "	]'){ '"' + ([string]$_ -replace '"','\"') + '"' } else { [string]$_ } }) -join ' ')
+}
+
+# Start curl in a hidden window; optionally redirect stdout to $outFile (used
+# by the speed probes to read back the -w %{speed_download} value).
+function Start-CurlProc([string[]]$argArr,[string]$outFile){
+  $argLine = Get-CurlArgLine $argArr
+  if($outFile){
+    $p = Start-Process -FilePath 'curl.exe' -ArgumentList $argLine -PassThru -WindowStyle Hidden -RedirectStandardOutput $outFile -RedirectStandardError ($outFile + '.err')
+  } else {
+    $p = Start-Process -FilePath 'curl.exe' -ArgumentList $argLine -PassThru -WindowStyle Hidden
+  }
+  return $p
+}
+
+# Read the Windows system proxy (the one browsers use). Returns $null when
+# there is none. Handles 'host:port', 'http=..;https=..' and 'socks=..'.
+function Get-SystemProxy{
+  try{
+    $ie = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction Stop
+    if($ie.ProxyEnable -eq 1 -and $ie.ProxyServer){
+      $s = [string]$ie.ProxyServer
+      if($s -match '='){
+        $m = [regex]::Match($s, '(?:https?|socks)=([^;]+)')
+        if($m.Success){ $s = $m.Groups[1].Value.Trim() }
+        if($s -match '^socks'){ return 'socks5h://' + ($s -replace '^socks\S*=','') }
+      }
+      return $s.Trim()
+    }
+  }catch{}
+  return $null
+}
+
+# Enumerate direct IP candidates for a host: system DNS + AliDNS (223.5.5.5).
+function Get-DirectIps([string]$hostName){
+  $list = New-Object System.Collections.Generic.List[string]
+  try{
+    [Net.Dns]::GetHostAddresses($hostName) | ForEach-Object {
+      if(-not $list.Contains($_.IPAddressToString)){ $list.Add($_.IPAddressToString) }
+    }
+  }catch{}
+  try{
+    $ali = & nslookup $hostName 223.5.5.5 2>$null | Select-String -Pattern '\b(\d{1,3}\.){3}\d{1,3}\b' | ForEach-Object { $_.Matches[0].Value } | Where-Object { $_ -ne '223.5.5.5' }
+    foreach($a in $ali){ if(-not $list.Contains($a)){ $list.Add($a) } }
+  }catch{}
+  return @($list)
+}
+
+# Speed-test every candidate channel in parallel and return the best one:
+# @{ Id; Speed; Args } or $null if everything failed.
+# Speed-test every candidate channel in parallel against a REAL file (the
+# biggest one being deployed, so sustained throughput is measured - small
+# files give misleading results on CDN edges) and return the fastest channels
+# sorted, best first (max 3). Each entry: @{ Id; Speed; Args; Label }.
+function Select-BestChannel([string]$probeUrl){
+  $sysProxy = Get-SystemProxy
+  $channels = @()
+  $idx = 0
+  if($sysProxy){ $channels += @{ Id='PROXY'; Args=@('--proxy',$sysProxy); Label=$sysProxy } }
+  foreach($ip in (Get-DirectIps 'edge.forgecdn.net')){
+    $idx++
+    $channels += @{ Id=('IP'+$idx); Args=@('--resolve',('edge.forgecdn.net:443:'+$ip)); Label=$ip }
+  }
+  if($channels.Count -eq 0){ return @() }
+  $tmp = Join-Path $Work 'probe'
+  New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+  $procs = @()
+  foreach($ch in $channels){
+    $outFile = Join-Path $tmp ('spd_' + $ch.Id + '.txt')
+    $a = @('-s','-L','--max-time','8') + $ch.Args + @('-o','NUL','-w','%{speed_download}',$probeUrl)
+    $p = Start-CurlProc $a $outFile
+    $procs += @{ Ch = $ch; Proc = $p; Out = $outFile }
+  }
+  while(@($procs | Where-Object { -not $_.Proc.HasExited }).Count -gt 0){ Start-Sleep -Milliseconds 300 }
+  Start-Sleep -Milliseconds 200
+  $okList = New-Object System.Collections.Generic.List[object]
+  foreach($pr in $procs){
+    $spd = 0.0
+    try{
+      if(Test-Path -LiteralPath $pr.Out){
+        $t = [IO.File]::ReadAllText($pr.Out)
+        if($t -match '^(\d+(\.\d+)?)'){ $spd = [double]$Matches[1] }
+      }
+    }catch{}
+    if($spd -gt 0){
+      Write-Host ('    ' + $pr.Ch.Id.PadRight(7) + ' ' + $pr.Ch.Label.PadRight(22) + ('{0,9:N0}' -f $spd) + ' B/s') -ForegroundColor Gray
+      $okList.Add(@{ Id=$pr.Ch.Id; Speed=$spd; Args=$pr.Ch.Args; Label=$pr.Ch.Label }) | Out-Null
+    } else {
+      Write-Host ('    ' + $pr.Ch.Id.PadRight(7) + ' ' + $pr.Ch.Label.PadRight(22) + '    FAILED') -ForegroundColor DarkGray
+    }
+  }
+  Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+  return @($okList | Sort-Object -Property @{Expression={$_.Speed};Descending=$true} | Select-Object -First 3)
+}
+
+function Read-ChannelCache{
+  try{
+    if(Test-Path -LiteralPath $CacheFile){
+      $j = Get-Content -LiteralPath $CacheFile -Raw | ConvertFrom-Json
+      if($null -ne $j -and $null -ne $j.cdn){ return $j.cdn }
+    }
+  }catch{}
+  return $null
+}
+
+function Write-ChannelCache($cdn){
+  try{
+    $obj = @{ cdn = $cdn }
+    $obj | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $CacheFile -Encoding UTF8
+  }catch{}
+}
+
+# Pick the newest file for a project from a parsed /files JSON (page 1).
+# Prefers, in order: release channel files matching 1.15.x, then 1.14.x,
+# then 1.13.x, then simply the newest release-channel file.
+function Select-FileFromJson($j){
+  if($null -eq $j -or $null -eq $j.data){ return $null }
+  $files = @($j.data)
+  if($files.Count -eq 0){ return $null }
+  $rel = @($files | Where-Object { $_.releaseType -eq 1 })
+  if($rel.Count -eq 0){ $rel = $files }
+  foreach($pref in '^1\.15','^1\.14','^1\.13'){
+    $hit = @($rel | Where-Object { $f = $_; @($f.gameVersions | Where-Object { $_ -match $pref }).Count -gt 0 } | Select-Object -First 1)
+    if($hit.Count -gt 0){ return $hit[0] }
+  }
+  return ($rel | Select-Object -First 1)
+}
+
 # Fetch JSON from the official CurseForge Core API. Returns parsed JSON or
 # $null. Network glitches get one quick retry.
 function Invoke-CoreJson($path){
@@ -170,7 +308,7 @@ function Invoke-CfJson($url){
 }
 
 # Follow the CurseForge download redirect once (Schannel) and return the
-# direct ForgeCDN link, which curl can fetch without being challenged.
+# direct ForgeCDN link.
 function Resolve-CdnUrl($downloadUrl){
   for($attempt = 1; $attempt -le 2; $attempt++){
     try{
@@ -194,10 +332,8 @@ function Resolve-CdnUrl($downloadUrl){
   return $null
 }
 
-# Pick the newest Classic Era release for a project via the Core API.
-# Pages through the newest files (max 200) and prefers, in order:
-# release channel files matching 1.15.x, then 1.14.x, then 1.13.x,
-# then simply the newest release-channel file.
+# Same selection as Select-FileFromJson, but paging through newest files
+# (max 200) - used as serial fallback for projects page 1 did not resolve.
 function Resolve-ProjectCore($projId){
   $all = New-Object System.Collections.Generic.List[object]
   for($page = 0; $page -lt 4; $page++){
@@ -210,7 +346,7 @@ function Resolve-ProjectCore($projId){
     $hit = @($rel | Where-Object { $f = $_; @($f.gameVersions | Where-Object { $_ -match '^1\.15' }).Count -gt 0 } | Select-Object -First 1)
     if($hit.Count -gt 0){ return $hit[0] }
     if($files.Count -lt 50){ break }
-    Start-Sleep -Milliseconds 200
+    Start-Sleep -Milliseconds 50
   }
   if($all.Count -eq 0){ return $null }
   $rel = @($all | Where-Object { $_.releaseType -eq 1 })
@@ -250,7 +386,9 @@ function Test-ZipFile($path){
 }
 
 function Invoke-CurlDownload($url,$outFile,$timeoutSec){
-  & curl.exe -s -L --fail --retry 3 --retry-delay 2 --connect-timeout 30 --max-time $timeoutSec -A $Ua -e $Referer -o $outFile $url
+  $extra = @()
+  if($ChProxy){ $extra += @('--proxy',$ChProxy) }
+  & curl.exe -s -L --fail --retry 3 --retry-delay 2 --connect-timeout 30 --max-time $timeoutSec -A $Ua -e $Referer @extra -o $outFile $url
   return ($LASTEXITCODE -eq 0)
 }
 
@@ -291,91 +429,161 @@ $Work = Join-Path $env:TEMP ('AddonDeploy_' + [Guid]::NewGuid().ToString('N').Su
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
 $DlDir = Join-Path $Work 'downloads'
 New-Item -ItemType Directory -Force -Path $DlDir | Out-Null
-# --------------------- phase 1: resolve latest files ------------------------
+
+# --------------------- phase 1: resolve latest files (parallel) -------------
 Write-Host ''
-Write-Host '[1/4] Resolving latest Classic Era files on CurseForge ...' -ForegroundColor Green
+Write-Host '[1/5] Resolving latest Classic Era files on CurseForge (parallel) ...' -ForegroundColor Green
 $resolved     = New-Object System.Collections.Generic.List[object]
 $resolveFail  = New-Object System.Collections.Generic.List[string]
 $coreFail     = New-Object System.Collections.Generic.List[object]
 
-$i = 0
+# Phase 1a: fire off one /files page-1 request per project, x$Concurrency.
+$apiQueue = New-Object System.Collections.Generic.Queue[object]
 foreach($p in $Projects){
-  $i++
-  Show-Bar ($i / $Projects.Count) ('resolving ' + $p.Name + ' (' + $i + '/' + $Projects.Count + ')')
-  $file = Resolve-ProjectCore $p.Id
-  if($null -eq $file){
-    $coreFail.Add($p) | Out-Null
-  } else {
-    $dlUrl  = [string]$file.downloadUrl
-    $isCore = $false
-    if([string]::IsNullOrEmpty($dlUrl)){
-      $dlUrl  = $CoreBase + '/mods/' + $p.Id + '/files/' + $file.id + '/download'
-      $isCore = $true
-    }
-    $resolved.Add(@{
-      Name    = $p.Name
-      ProjId  = $p.Id
-      FileId  = $file.id
-      ZipName = [string]$file.fileName
-      Len     = [long]$file.fileLength
-      Url     = $dlUrl
-      Core    = $isCore
-      DlUrl   = ''
-      ZipPath = Join-Path $DlDir ([string]$file.fileName)
-      Tries   = 0
-    }) | Out-Null
-  }
-  Start-Sleep -Milliseconds 200
+  $jsonPath = Join-Path $Work ('api_' + $p.Id + '.json')
+  $apiQueue.Enqueue(@{
+    Name = $p.Name
+    Id   = $p.Id
+    Json = $jsonPath
+    Url  = ($CoreBase + '/mods/' + $p.Id + '/files?pageSize=50&index=0')
+  }) | Out-Null
 }
-Finish-Line
-
-# Fallback: projects the Core API could not serve are scraped from the
-# Cloudflare-protected website instead (slow but reliable).
-if($coreFail.Count -gt 0){
-  Show-Info ('Core API unavailable for ' + $coreFail.Count + ' projects - falling back to website scraping ...') 'Yellow'
-  $pending = $coreFail.ToArray()
-  for($pass = 1; $pass -le 2 -and $pending.Count -gt 0; $pass++){
-    if($pass -eq 2){
-      Show-Info ('Second pass: retrying ' + $pending.Count + ' blocked projects after a ' + $SilenceSec + 's silence ...') 'Yellow'
-      Start-Sleep -Seconds $SilenceSec
-    }
-    $stillFail  = New-Object System.Collections.Generic.List[object]
-    $consecFail = 0
-    $batch      = $pending
-    $i = 0
-    foreach($p in $batch){
-      $i++
-      $label = 'resolving ' + $p.Name + ' (' + $i + '/' + $batch.Count + ')'
-      if($pass -eq 2){ $label += ' [retry]' }
-      Show-Bar ($i / $batch.Count) $label
-      $file = Resolve-Project $p.Id
-      if($null -eq $file){
-        $consecFail++
-        if($pass -eq 1){ $stillFail.Add($p) | Out-Null } else { $resolveFail.Add($p.Name) | Out-Null }
-        if($consecFail -eq 3 -and $i -lt $batch.Count){
-          Show-Info ('Cloudflare is challenging us - going silent for ' + $SilenceSec + 's ...') 'Yellow'
-          Start-Sleep -Seconds $SilenceSec
-          $consecFail = 0
+$apiActive = @{}
+$apiDone = 0
+while($apiQueue.Count -gt 0 -or $apiActive.Count -gt 0){
+  while($apiActive.Count -lt $Concurrency -and $apiQueue.Count -gt 0){
+    $it = $apiQueue.Dequeue()
+    $curlArgs = @('-s','--fail','--max-time','60','--retry','2','--retry-delay','2')
+    if($ChProxy){ $curlArgs += @('--proxy',$ChProxy) }
+    $curlArgs += @('-H',('x-api-key: ' + $CfApiKey),'-H','Accept: application/json','-o',$it.Json,$it.Url)
+    $proc = Start-CurlProc $curlArgs $null
+    $apiActive[$it.Name] = @{ Proc = $proc; Item = $it }
+  }
+  Start-Sleep -Milliseconds 300
+  foreach($key in @($apiActive.Keys)){
+    $a = $apiActive[$key]
+    if($a.Proc.HasExited){
+      $apiDone++
+      Show-Bar ($apiDone / $Projects.Count) ('resolving ' + $a.Item.Name + ' (' + $apiDone + '/' + $Projects.Count + ')')
+      $it = $a.Item
+      $ok = ($a.Proc.ExitCode -eq 0) -and (Test-Path -LiteralPath $it.Json) -and ((Get-Item -LiteralPath $it.Json).Length -gt 10)
+      $file = $null
+      if($ok){
+        try{
+          $j = [IO.File]::ReadAllText($it.Json) | ConvertFrom-Json
+          $file = Select-FileFromJson $j
+        }catch{}
+      }
+      if($null -ne $file){
+        $dlUrl  = [string]$file.downloadUrl
+        $isCore = $false
+        if([string]::IsNullOrEmpty($dlUrl)){
+          $dlUrl  = $CoreBase + '/mods/' + $it.Id + '/files/' + $file.id + '/download'
+          $isCore = $true
         }
-      } else {
-        $consecFail = 0
         $resolved.Add(@{
-          Name    = $p.Name
-          ProjId  = $p.Id
+          Name    = $it.Name
+          ProjId  = $it.Id
           FileId  = $file.id
           ZipName = [string]$file.fileName
           Len     = [long]$file.fileLength
-          Url     = $ApiBase + '/mods/' + $p.Id + '/files/' + $file.id + '/download'
-          Core    = $false
+          Url     = $dlUrl
+          Core    = $isCore
           DlUrl   = ''
           ZipPath = Join-Path $DlDir ([string]$file.fileName)
           Tries   = 0
         }) | Out-Null
+      } else {
+        $coreFail.Add($it) | Out-Null
       }
-      Start-Sleep -Milliseconds (Get-Random -Minimum 1200 -Maximum 2600)
+      $apiActive.Remove($key)
     }
-    Finish-Line
-    $pending = $stillFail.ToArray()
+  }
+}
+Finish-Line
+
+# Phase 1b: serial fallback (paging) for the projects page 1 did not resolve.
+if($coreFail.Count -gt 0){
+  Show-Info ('Page 1 missed ' + $coreFail.Count + ' projects - retrying with paging ...') 'Yellow'
+  $pending = $coreFail.ToArray()
+  $stillFail = New-Object System.Collections.Generic.List[object]
+  $i = 0
+  foreach($p in $pending){
+    $i++
+    Show-Bar ($i / $pending.Count) ('resolving (paging) ' + $p.Name + ' (' + $i + '/' + $pending.Count + ')')
+    $file = Resolve-ProjectCore $p.Id
+    if($null -eq $file){
+      $stillFail.Add($p) | Out-Null
+    } else {
+      $dlUrl  = [string]$file.downloadUrl
+      $isCore = $false
+      if([string]::IsNullOrEmpty($dlUrl)){
+        $dlUrl  = $CoreBase + '/mods/' + $p.Id + '/files/' + $file.id + '/download'
+        $isCore = $true
+      }
+      $resolved.Add(@{
+        Name    = $p.Name
+        ProjId  = $p.Id
+        FileId  = $file.id
+        ZipName = [string]$file.fileName
+        Len     = [long]$file.fileLength
+        Url     = $dlUrl
+        Core    = $isCore
+        DlUrl   = ''
+        ZipPath = Join-Path $DlDir ([string]$file.fileName)
+        Tries   = 0
+      }) | Out-Null
+    }
+    Start-Sleep -Milliseconds 50
+  }
+  Finish-Line
+  $pending2 = $stillFail.ToArray()
+  # Fallback: projects the Core API could not serve are scraped from the
+  # Cloudflare-protected website instead (slow but reliable).
+  if($pending2.Count -gt 0){
+    Show-Info ('Core API unavailable for ' + $pending2.Count + ' projects - falling back to website scraping ...') 'Yellow'
+    for($pass = 1; $pass -le 2 -and $pending2.Count -gt 0; $pass++){
+      if($pass -eq 2){
+        Show-Info ('Second pass: retrying ' + $pending2.Count + ' blocked projects after a ' + $SilenceSec + 's silence ...') 'Yellow'
+        Start-Sleep -Seconds $SilenceSec
+      }
+      $stillFail2 = New-Object System.Collections.Generic.List[object]
+      $consecFail = 0
+      $i = 0
+      foreach($p in $pending2){
+        $i++
+        $label = 'resolving ' + $p.Name + ' (' + $i + '/' + $pending2.Count + ')'
+        if($pass -eq 2){ $label += ' [retry]' }
+        Show-Bar ($i / $pending2.Count) $label
+        $file = Resolve-Project $p.Id
+        if($null -eq $file){
+          $consecFail++
+          if($pass -eq 1){ $stillFail2.Add($p) | Out-Null } else { $resolveFail.Add($p.Name) | Out-Null }
+          if($consecFail -eq 3 -and $i -lt $pending2.Count){
+            Show-Info ('Cloudflare is challenging us - going silent for ' + $SilenceSec + 's ...') 'Yellow'
+            Start-Sleep -Seconds $SilenceSec
+            $consecFail = 0
+          }
+        } else {
+          $consecFail = 0
+          $resolved.Add(@{
+            Name    = $p.Name
+            ProjId  = $p.Id
+            FileId  = $file.id
+            ZipName = [string]$file.fileName
+            Len     = [long]$file.fileLength
+            Url     = $ApiBase + '/mods/' + $p.Id + '/files/' + $file.id + '/download'
+            Core    = $false
+            DlUrl   = ''
+            ZipPath = Join-Path $DlDir ([string]$file.fileName)
+            Tries   = 0
+          }) | Out-Null
+        }
+        Start-Sleep -Milliseconds (Get-Random -Minimum 600 -Maximum 1200)
+      }
+      Finish-Line
+      $pending2 = $stillFail2.ToArray()
+    }
   }
 }
 
@@ -387,9 +595,102 @@ if($resolveFail.Count -gt 0){
   Write-Host ('  FAILED to resolve: ' + ($resolveFail -join ', ')) -ForegroundColor Red
 }
 
-# ------------------- phase 2: locate CDN links + download -------------------
+# ------------------ phase 2: select fastest download channel ---------------
 Write-Host ''
-Write-Host ('[2/4] Downloading from CurseForge (parallel x' + $Concurrency + ') ...') -ForegroundColor Green
+Write-Host '[2/5] Selecting fastest download channel ...' -ForegroundColor Green
+$ChProxy = $null
+$ChIp    = $null
+$cache   = Read-ChannelCache
+$useCache = $false
+if($null -ne $cache -and $cache.ts -and $cache.mode){
+  try{
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if(($now - [int64]$cache.ts) -lt $CacheTtl){ $useCache = $true }
+  }catch{}
+}
+if($useCache){
+  if($cache.mode -eq 'proxy' -and $cache.proxy){
+    $ChProxy = [string]$cache.proxy
+    Write-Host ('  Using cached channel: system proxy ' + $ChProxy + ' (' + ('{0:N0}' -f [double]$cache.speed) + ' B/s)') -ForegroundColor Green
+  } elseif($cache.mode -eq 'ip' -and $cache.ip){
+    $ChIp = [string]$cache.ip
+    Write-Host ('  Using cached channel: direct IP ' + $ChIp + ' (' + ('{0:N0}' -f [double]$cache.speed) + ' B/s)') -ForegroundColor Green
+  } else {
+    $useCache = $false
+  }
+}
+if(-not $useCache){
+  # Probe with the BIGGEST resolved file - small files give misleading
+  # throughput on CDN edges (fast start, slow sustained), while the whole
+  # download experience depends on sustained speed.
+  $probeR = @($resolved | Where-Object { ([string]$_.Url).StartsWith('https://edge.forgecdn.net') } | Sort-Object -Property @{Expression={$_.Len};Descending=$true} | Select-Object -First 1)
+  if($probeR.Count -eq 0){ $probeR = @($resolved | Where-Object { $_.Url -ne '' } | Sort-Object -Property @{Expression={$_.Len};Descending=$true} | Select-Object -First 1) }
+  if($probeR.Count -gt 0){
+    $pUrl = [string]$probeR[0].Url
+    if($pUrl -notmatch 'api-key='){ $pUrl += '?api-key=' + $CdnToken }
+    Write-Host '  Probing channels (8s each, parallel):' -ForegroundColor Gray
+    $best = Select-BestChannel $pUrl
+    if($best.Count -gt 0){
+      if($best[0].Id -eq 'PROXY'){
+        $ChProxy = $best[0].Args[1]
+        Write-Host ('  -> Using system proxy: ' + $ChProxy + ' (' + ('{0:N0}' -f $best[0].Speed) + ' B/s)') -ForegroundColor Green
+      } else {
+        $ChIp = ($best[0].Args[1] -split ':')[-1]
+        Write-Host ('  -> Using direct IP: ' + $ChIp + ' (' + ('{0:N0}' -f $best[0].Speed) + ' B/s)') -ForegroundColor Green
+      }
+      $cdn = @{
+        mode  = $(if($best[0].Id -eq 'PROXY'){ 'proxy' } else { 'ip' })
+        proxy = $(if($best[0].Id -eq 'PROXY'){ $ChProxy } else { $null })
+        ip    = $(if($best[0].Id -eq 'PROXY'){ $null } else { $ChIp })
+        speed = $best[0].Speed
+        ts    = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+      }
+      Write-ChannelCache $cdn
+      # Channel pool: keep only channels in the same league as the fastest
+      # one (>= 50% of its speed, at least 500 KB/s). Rotating through a
+      # pool that mixes 10 MB/s and 40 KB/s channels would stall half the
+      # downloads; when everything is slow (no proxy), the top channels are
+      # still rotated to spread the risk.
+      $fastest = [double]$best[0].Speed
+      $threshold = [Math]::Max(500000.0, $fastest * 0.5)
+      $ChannelPool = @()
+      foreach($b in $best){
+        if([double]$b.Speed -ge $threshold){ $ChannelPool += @{ Id=$b.Id; Args=$b.Args; Fails=0 } }
+      }
+      if($ChannelPool.Count -eq 0 -and $best.Count -gt 0){
+        $ChannelPool += @{ Id=$best[0].Id; Args=$best[0].Args; Fails=0 }
+      }
+      $PoolIdx = 0
+    } else {
+      Write-Host '  All channels failed - using the default direct connection.' -ForegroundColor Yellow
+      $ChannelPool = @()
+    }
+  } else {
+    Write-Host '  Nothing to probe - using the default direct connection.' -ForegroundColor Yellow
+    $ChannelPool = @()
+  }
+} else {
+  # Cache hit: single-channel pool (a fresh probe happens after the TTL).
+  $ChannelPool = @()
+  if($ChProxy){ $ChannelPool += @{ Id='PROXY'; Args=@('--proxy',$ChProxy); Fails=0 } }
+  elseif($ChIp){ $ChannelPool += @{ Id='IP'; Args=@('--resolve',('edge.forgecdn.net:443:' + $ChIp)); Fails=0 } }
+  $PoolIdx = 0
+}
+
+# Rotate through the channel pool; returns the curl args for the next
+# download. Falls back to a plain direct connection when the pool is empty.
+function Get-NextChannelArgs{
+  if($ChannelPool.Count -eq 0){ return @() }
+  $script:PoolIdx = $script:PoolIdx + 1
+  $ch = $ChannelPool[($script:PoolIdx) % $ChannelPool.Count]
+  if($null -eq $ch){ return @() }
+  return @($ch.Args)
+}
+
+# ------------------- phase 3: locate CDN links + download -------------------
+$SilenceSec = $CdnSilenceSec
+Write-Host ''
+Write-Host ('[3/5] Downloading from CurseForge (parallel x' + $Concurrency + ') ...') -ForegroundColor Green
 
 # Direct ForgeCDN links from the Core API need no extra lookup.
 foreach($r in $resolved){
@@ -412,7 +713,14 @@ if($cdnPending.Count -gt 0){
       Show-Bar ($i / $cdnPending.Count) ('locating CDN link ' + $r.Name + ' (' + $i + '/' + $cdnPending.Count + ')')
       $cdn = $null
       if($r.Core -eq $true){
-        try{ $cdn = [string](Invoke-RestMethod -Uri $r.Url -Headers $CoreHeaders -TimeoutSec 60) }catch{ $cdn = $null }
+        try{
+            $resp = Invoke-RestMethod -Uri $r.Url -Headers $CoreHeaders -TimeoutSec 60
+            if($resp -is [string]){ $cdn = [string]$resp }
+            elseif($null -ne $resp.data){
+              if($resp.data -is [string]){ $cdn = [string]$resp.data }
+              elseif($null -ne $resp.data.downloadUrl){ $cdn = [string]$resp.data.downloadUrl }
+            }
+          }catch{ $cdn = $null }
         if([string]::IsNullOrEmpty($cdn)){ $cdn = $null }
       } else {
         $cdn = Resolve-CdnUrl $r.Url
@@ -424,12 +732,12 @@ if($cdnPending.Count -gt 0){
         $consecFail++
         if($pass -eq 1){ $stillFail.Add($r) | Out-Null } else { $dlFailedEarly = $true }
         if($consecFail -eq 3 -and $i -lt $cdnPending.Count){
-          Show-Info ('CDN lookup keeps failing - going silent for ' + $SilenceSec + 's ...') 'Yellow'
+          Show-Info ('CDN lookup keeps failing - going silent for ' + $CdnSilenceSec + 's ...') 'Yellow'
           Start-Sleep -Seconds $SilenceSec
           $consecFail = 0
         }
       }
-      Start-Sleep -Milliseconds (Get-Random -Minimum 300 -Maximum 800)
+      Start-Sleep -Milliseconds (Get-Random -Minimum 50 -Maximum 150)
     }
     Finish-Line
     $cdnPending = $stillFail.ToArray()
@@ -456,17 +764,17 @@ foreach($r in $resolved){
 $active    = @{}
 $doneBytes = [long]0
 $doneCount = 0
+$gaveUp    = New-Object System.Collections.Generic.List[object]
 
 while($queue.Count -gt 0 -or $active.Count -gt 0){
   while($active.Count -lt $Concurrency -and $queue.Count -gt 0){
     $it = $queue.Dequeue()
-    $curlArgs = @('-s','-L','--fail','--retry','2','--retry-delay','3','--connect-timeout','30','--max-time','7200','-A',$Ua,'-o',$it.ZipPath,$it.DlUrl)
-    $argLine = (($curlArgs | ForEach-Object { if([string]$_ -match '[ "	]'){ '"' + ([string]$_ -replace '"','\"') + '"' } else { [string]$_ } }) -join ' ')
-    $proc = Start-Process -FilePath 'curl.exe' -ArgumentList $argLine -PassThru -WindowStyle Hidden
+    $curlArgs = @('-s','-L','--fail','--retry','2','--retry-delay','3','--connect-timeout','30','--max-time','7200','-A',$Ua,'-o',$it.ZipPath) + (Get-NextChannelArgs) + @($it.DlUrl)
+    $proc = Start-CurlProc $curlArgs $null
     $active[$it.ZipPath] = @{ Proc = $proc; Item = $it }
-    if($queue.Count -gt 0){ Start-Sleep -Milliseconds (Get-Random -Minimum 1000 -Maximum 2000) }
+    if($queue.Count -gt 0){ Start-Sleep -Milliseconds (Get-Random -Minimum 50 -Maximum 150) }
   }
-  Start-Sleep -Milliseconds 700
+  Start-Sleep -Milliseconds 400
   foreach($key in @($active.Keys)){
     $a = $active[$key]
     if($a.Proc.HasExited){
@@ -485,7 +793,7 @@ while($queue.Count -gt 0 -or $active.Count -gt 0){
           Start-Sleep -Seconds 10
           $queue.Enqueue($a.Item)
         } else {
-          $dlFailed.Add($a.Item.Name) | Out-Null
+          $gaveUp.Add($a.Item) | Out-Null
         }
       }
       $active.Remove($key)
@@ -502,27 +810,49 @@ while($queue.Count -gt 0 -or $active.Count -gt 0){
   Show-Bar $ratio ('downloading ' + $mbDone + '/' + $mbAll + ' MB | done ' + $doneCount + '/' + ($doneCount + $remain) + ' | pending ' + $remain)
 }
 Finish-Line
+
+# Last resort: retry the given-up files once through the plain direct path.
+if($gaveUp.Count -gt 0){
+  Show-Info ('Retrying ' + $gaveUp.Count + ' failed files via default route ...') 'Yellow'
+  foreach($it in $gaveUp){
+    $curlArgs = @('-s','-L','--fail','--retry','1','--connect-timeout','30','--max-time','7200','-A',$Ua,'-o',$it.ZipPath,$it.DlUrl)
+    & curl.exe @curlArgs
+    $size = [long]0
+    if(Test-Path -LiteralPath $it.ZipPath){ $size = (Get-Item -LiteralPath $it.ZipPath).Length }
+    if(($LASTEXITCODE -eq 0) -and ($size -gt 0) -and (Test-ZipFile $it.ZipPath)){
+      $doneBytes += $size
+      $doneCount++
+      Write-Host ('    OK: ' + $it.Name) -ForegroundColor Green
+    } else {
+      $dlFailed.Add($it.Name) | Out-Null
+      if(Test-Path -LiteralPath $it.ZipPath){ Remove-Item -LiteralPath $it.ZipPath -Force -ErrorAction SilentlyContinue }
+    }
+  }
+}
 if($dlFailed.Count -gt 0){
   Write-Host ('  Download FAILED: ' + (($dlFailed | ForEach-Object { ($_ -replace ' \(no CDN link\)','') }) -join ', ')) -ForegroundColor Red
 } else {
   Write-Host ('  All ' + $doneCount + ' zip files downloaded.') -ForegroundColor Gray
 }
 
-# ------------------------ phase 3: extract packages -------------------------
+# ------------------------ phase 4: extract packages -------------------------
 Write-Host ''
-Write-Host '[3/4] Extracting addons into target directory ...' -ForegroundColor Green
+Write-Host '[4/5] Extracting addons into target directory ...' -ForegroundColor Green
 $extractOk   = New-Object System.Collections.Generic.List[string]
 $extractFail = New-Object System.Collections.Generic.List[string]
 $zips = @($resolved | Where-Object { (Test-Path -LiteralPath $_.ZipPath) -and -not ($dlFailed -contains $_.Name) })
-$i = 0
-foreach($r in $zips){
-  $i++
-  Show-Bar ($i / $zips.Count) ('extracting ' + $r.Name + ' (' + $i + '/' + $zips.Count + ')')
-  $stage = Join-Path $Work ('stage_' + [Guid]::NewGuid().ToString('N').Substring(0,8))
+
+$tarCmd = $null
+try { if(Get-Command tar.exe -ErrorAction Stop){ $tarCmd = 'tar.exe' } } catch {}
+$tarWorkers = 4
+$tarQueue = New-Object System.Collections.Generic.Queue[object]
+foreach($r in $zips){ $tarQueue.Enqueue($r) | Out-Null }
+$tActive = @{}
+$tDone = 0
+
+function Complete-Extract($r,$stage){
   try{
-    New-Item -ItemType Directory -Force -Path $stage | Out-Null
-    Expand-Archive -LiteralPath $r.ZipPath -DestinationPath $stage -Force
-    $tops = @(Get-ChildItem -LiteralPath $stage -Directory)
+    $tops = @(Get-ChildItem -LiteralPath $stage -Directory -ErrorAction Stop)
     if($tops.Count -eq 0){ throw 'zip contains no addon folder' }
     foreach($d in $tops){
       $target = Join-Path $DeployDir $d.Name
@@ -536,10 +866,63 @@ foreach($r in $zips){
     if(Test-Path -LiteralPath $stage){ Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
   }
 }
+
+while($tarQueue.Count -gt 0 -or $tActive.Count -gt 0){
+  while($tActive.Count -lt $tarWorkers -and $tarQueue.Count -gt 0){
+    $r = $tarQueue.Dequeue()
+    $stage = Join-Path $Work ('stage_' + [Guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Force -Path $stage | Out-Null
+    if($tarCmd){
+      $argLine = Get-CurlArgLine @('-xf',$r.ZipPath,'-C',$stage)
+      $proc = Start-Process -FilePath $tarCmd -ArgumentList $argLine -PassThru -WindowStyle Hidden
+    } else {
+      $proc = $null
+    }
+    $tActive[$r.Name] = @{ Proc = $proc; Item = $r; Stage = $stage; Tar = ($null -ne $proc) }
+  }
+  Start-Sleep -Milliseconds 300
+  foreach($key in @($tActive.Keys)){
+    $a = $tActive[$key]
+    $done = $false
+    if($a.Tar){
+      if($a.Proc.HasExited){
+        if($a.Proc.ExitCode -eq 0){
+          $done = $true
+          Complete-Extract $a.Item $a.Stage
+        } else {
+          # tar failed - fall back to Expand-Archive
+          try{
+            Expand-Archive -LiteralPath $a.Item.ZipPath -DestinationPath $a.Stage -Force
+            $done = $true
+            Complete-Extract $a.Item $a.Stage
+          }catch{
+            $extractFail.Add($a.Item.Name + ' (' + $_.Exception.Message + ')') | Out-Null
+            if(Test-Path -LiteralPath $a.Stage){ Remove-Item -LiteralPath $a.Stage -Recurse -Force -ErrorAction SilentlyContinue }
+          }
+        }
+      }
+    } else {
+      try{
+        Expand-Archive -LiteralPath $a.Item.ZipPath -DestinationPath $a.Stage -Force
+        $done = $true
+        Complete-Extract $a.Item $a.Stage
+      }catch{
+        $extractFail.Add($a.Item.Name + ' (' + $_.Exception.Message + ')') | Out-Null
+        if(Test-Path -LiteralPath $a.Stage){ Remove-Item -LiteralPath $a.Stage -Recurse -Force -ErrorAction SilentlyContinue }
+      }
+    }
+    if($done){
+      $tDone++
+      Show-Bar ($tDone / $zips.Count) ('extracting ' + $a.Item.Name + ' (' + $tDone + '/' + $zips.Count + ')')
+      $tActive.Remove($key)
+    }
+  }
+}
 Finish-Line
-# ------------------------- phase 4: own SoD addons --------------------------
+
+# ------------------------- phase 5: own SoD addons --------------------------
 Write-Host ''
-Write-Host '[4/4] Deploying own SoD addons from git workspace ...' -ForegroundColor Green
+Write-Host '[5/5] Deploying own SoD addons from git workspace ...' -ForegroundColor Green
 $sodOk   = New-Object System.Collections.Generic.List[string]
 $sodFail = New-Object System.Collections.Generic.List[string]
 $i = 0
