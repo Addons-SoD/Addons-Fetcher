@@ -7,9 +7,10 @@ One-click deployment script for World of Warcraft Classic Era (1.15.x client) ad
 - Downloads every CurseForge addon listed in the script (latest Classic Era file)
   through the official CurseForge Core API, with a www.curseforge.com scraper as
   fallback.
-- Deploys the `*-SoD` addons maintained under the
-  [Addons-SoD](https://github.com/Addons-SoD) account: copied from a local git
-  workspace when present, otherwise downloaded from GitHub.
+- Downloads the `*-SoD` addons maintained under the
+  [Addons-SoD](https://github.com/Addons-SoD) account directly from GitHub as
+  source archive zips (works identically on every machine - no local git
+  workspace required).
 - Extracts everything into the `Addons` subfolder next to the script. The
   script is meant to live in the `Interface` folder, so addons land in
   `...\_classic_era_\Interface\Addons` (i.e. the game's `AddOns` directory).
@@ -60,6 +61,21 @@ The repository ignores the `Addons/` folder, so you can also clone this
 repository directly into your `Interface` folder, keep it up to date with
 `git pull`, and run `Addons-Fetcher.cmd` from there.
 
+
+## Stability (v3)
+
+- **Slow-download guard** - a transfer averaging below 50 KB/s is killed and
+  retried on another channel; after 3 slow kills the CDN channels are
+  re-probed and the fastest one is picked again, so flaky networks self-heal
+  mid-run.
+- **Live throughput** - the progress bar shows the current overall download
+  speed (MB/s).
+- **CPU-scaled extraction** - extraction parallelism is logical cores - 2
+  (min 1).
+- SoD addons are downloaded from `codeload.github.com` first (direct, no
+  redirect), with the `github.com` archive and the GitHub API tarball as
+  fallbacks.
+
 ## Notes
 
 - Requires Windows PowerShell 5.1+ (built into Windows 10/11).
@@ -71,3 +87,4 @@ repository directly into your `Interface` folder, keep it up to date with
 ## License
 
 MIT - see [LICENSE](LICENSE).
+
