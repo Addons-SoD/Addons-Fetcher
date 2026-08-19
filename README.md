@@ -32,9 +32,12 @@ proxy. The script now handles both automatically:
    rotated across downloads so one flaky node cannot stall everything; files
    that still fail after retries get one last attempt through the plain
    default route.
-4. **30-minute cache** - the chosen channel is cached in
-   `.addons-fetcher-cache.json` next to the script, so repeat runs skip the
-   probing step entirely.
+4. **30-minute cache** - only *direct-IP* results are cached (in
+   `.addons-fetcher-cache.json` next to the script), so repeat runs without
+   a proxy skip the probing step. The system proxy is NEVER cached - it is
+   re-validated on every run, so turning your proxy off can never break a
+   download (a dead proxy simply fails its probe and the script falls back
+   to direct links).
 
 Other v2 speed-ups: metadata lookups run in parallel (x8) and extraction uses
 `tar.exe` with 4 workers (fallback: `Expand-Archive`).
