@@ -15,6 +15,30 @@ One-click deployment script for World of Warcraft Classic Era (1.15.x client) ad
   `...\_classic_era_\Interface\Addons` (i.e. the game's `AddOns` directory).
 - Deletes all downloaded zip files when finished.
 
+## Smart download channels (v2)
+
+Slow downloads are usually caused by poor direct routes to the CDN
+(CloudFront) and by the fact that `curl.exe` does not use the Windows system
+proxy. The script now handles both automatically:
+
+1. **Channel probing** - after resolving the file list it speed-tests, in
+   parallel, the Windows system proxy (if present) and every reachable CDN IP
+   (system DNS + AliDNS) against the *biggest real file* being deployed
+   (small files give misleading throughput on CDN edges).
+2. **Fastest channel wins** - downloads go through the fastest route found
+   (proxy or direct IP). No proxy is required: without one, the script simply
+   picks the best direct IP among several.
+3. **Channel pool** - the top channels (within the same speed league) are
+   rotated across downloads so one flaky node cannot stall everything; files
+   that still fail after retries get one last attempt through the plain
+   default route.
+4. **30-minute cache** - the chosen channel is cached in
+   `.addons-fetcher-cache.json` next to the script, so repeat runs skip the
+   probing step entirely.
+
+Other v2 speed-ups: metadata lookups run in parallel (x8) and extraction uses
+`tar.exe` with 4 workers (fallback: `Expand-Archive`).
+
 ## Usage
 
 1. Copy `Addons-Fetcher.cmd` into your `Interface` folder:
