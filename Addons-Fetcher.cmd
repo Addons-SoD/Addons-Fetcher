@@ -10,7 +10,7 @@ exit /b %ERRORLEVEL%
 #  - Downloads all CurseForge addons listed below (latest Classic Era file)
 #  - Downloads the *-SoD addons from GitHub (source archive zip; works on
 #    any machine, no local git workspace required)
-#  - Extracts everything into the 'Addons' subfolder next to THIS script
+#  - Extracts everything into the 'AddOns' subfolder next to THIS script
 #    (put this script into the 'Interface' folder and run it there)
 #  - Deletes all downloaded zip files when finished
 #  v3 changes:
@@ -45,7 +45,7 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 
 $Self      = $env:DEPLOY_SELF
 $ScriptDir = ($env:DEPLOY_DIR).TrimEnd('\')
-$DeployDir  = Join-Path $ScriptDir 'Addons'
+$DeployDir  = Join-Path $ScriptDir 'AddOns'
 $CacheFile = Join-Path $ScriptDir '.addons-fetcher-cache.json'
 $CacheTtl  = 1800
 
