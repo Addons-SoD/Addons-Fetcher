@@ -105,7 +105,13 @@ $Projects = @(
   @{ Name = 'WeakAuras';                Id = 65387   },
   @{ Name = 'WeWantBlueShamans';        Id = 962536  },
   @{ Name = 'alaGearMan';               Id = 347869  },
-  @{ Name = 'alaTradeSkill';            Id = 380889  }
+  @{ Name = 'alaTradeSkill';            Id = 380889  },
+  @{ Name = 'Ranker';                   Id = 907755  },
+  @{ Name = 'RuneReminderReforged';     Id = 1640798 },
+  @{ Name = 'TalentEmuX';               Id = 338706  },
+  @{ Name = 'GatherMate2_Data';         Id = 350035  },
+  @{ Name = '_DebugLog';                Id = 382165  },
+  @{ Name = 'LoonBestInSlot';           Id = 570934  }
 )
 
 # Own SoD addons from git repositories (repo name -> addon folder name)
@@ -119,7 +125,7 @@ $SodRepos = @(
 )
 
 # Not from CurseForge - left untouched on disk
-$External = @('_DebugLog','bloodOfHeros','GatherMate2_Data','LoonBestInSlot','MYStats','Ranker','RuneReminder','TalentEmuX')
+$External = @('bloodOfHeros','MYStats')
 # ------------------------------- helpers ------------------------------------
 function Test-Writable($dir){
   try{
@@ -141,7 +147,13 @@ function Show-Bar($ratio,$text){
   Write-Host ($line.PadRight(110)) -NoNewline
 }
 
-function Finish-Line{ Write-Host '' }
+function Finish-Line{
+  # Carriage-return to the line start, then overwrite the trailing
+  # progress-bar row (110 chars) so the last status text (e.g.
+  # '100% resolving <name>') does not linger on screen.
+  Write-Host ("`r" + (' ' * 110)) -NoNewline
+  Write-Host ''
+}
 
 function Show-Info($msg,$color){
   Write-Host ''
