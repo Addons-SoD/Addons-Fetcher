@@ -196,27 +196,20 @@ function Get-DirectIps([string]$hostName){
   return @($list)
 }
 
-# Speed-test every candidate channel in parallel and return the best one:
-# @{ Id; Speed; Args } or $null if everything failed.
-# Speed-test every candidate channel in parallel against a REAL file (the
-# biggest one being deployed, so sustained throughput is measured - small
-# files give misleading results on CDN edges) and return the fastest channels
-# sorted, best first (max 3). Each entry: @{ Id; Speed; Args; Label }.
-function Select-BestChannel([string]$probeUrl){
-  $sysProxy = Get-SystemProxy
-  $channels = @()
-  $idx = 0
-  if($sysProxy){ $channels += @{ Id='PROXY'; Args=@('--proxy',$sysProxy); Label=$sysProxy } }
-  foreach($ip in (Get-DirectIps 'edge.forgecdn.net')){
-    $idx++
-    $channels += @{ Id=('IP'+$idx); Args=@('--resolve',('edge.forgecdn.net:443:'+$ip)); Label=$ip }
-  }
-  if($channels.Count -eq 0){ return @() }
+# Speed-test the given candidate channels in parallel against a REAL file
+# (the biggest one being deployed, so sustained throughput is measured -
+# small files give misleading results on CDN edges) and return the fastest
+# channels sorted, best first (max 3). Each candidate: @{ Id; Args; Label };
+# each result: @{ Id; Speed; Args; Label }.
+function Probe-Channels($candidates,[string]$probeUrl){
+  if($null -eq $candidates -or @($candidates).Count -eq 0){ return @() }
   $tmp = Join-Path $Work 'probe'
   New-Item -ItemType Directory -Force -Path $tmp | Out-Null
   $procs = @()
-  foreach($ch in $channels){
-    $outFile = Join-Path $tmp ('spd_' + $ch.Id + '.txt')
+  $i = 0
+  foreach($ch in $candidates){
+    $i++
+    $outFile = Join-Path $tmp ('spd_' + $i + '.txt')
     $a = @('-s','-L','--max-time','8') + $ch.Args + @('-o','NUL','-w','%{speed_download}',$probeUrl)
     $p = Start-CurlProc $a $outFile
     $procs += @{ Ch = $ch; Proc = $p; Out = $outFile }
@@ -258,6 +251,10 @@ function Write-ChannelCache($cdn){
     $obj = @{ cdn = $cdn }
     $obj | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $CacheFile -Encoding UTF8
   }catch{}
+}
+
+function Remove-ChannelCache{
+  try{ if(Test-Path -LiteralPath $CacheFile){ Remove-Item -LiteralPath $CacheFile -Force -ErrorAction SilentlyContinue } }catch{}
 }
 
 # Pick the newest file for a project from a parsed /files JSON (page 1).
@@ -600,81 +597,97 @@ Write-Host ''
 Write-Host '[2/5] Selecting fastest download channel ...' -ForegroundColor Green
 $ChProxy = $null
 $ChIp    = $null
+$ChannelPool = @()
+$PoolIdx = 0
+
+# The system proxy is a DYNAMIC dependency: the user may turn it off at any
+# time while the registry entry stays behind. It is therefore NEVER cached -
+# it is re-validated on every run (a dead proxy simply fails the probe).
+# Only direct-IP results may be cached (CDN topology is stable within the
+# TTL). Legacy proxy-mode caches are ignored.
+$sysProxyNow = Get-SystemProxy
 $cache   = Read-ChannelCache
-$useCache = $false
-if($null -ne $cache -and $cache.ts -and $cache.mode){
+$cacheValid = $false
+if($null -ne $cache -and $cache.mode -eq 'ip' -and $cache.ip -and $cache.ts){
   try{
     $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    if(($now - [int64]$cache.ts) -lt $CacheTtl){ $useCache = $true }
+    if(($now - [int64]$cache.ts) -lt $CacheTtl){ $cacheValid = $true }
   }catch{}
 }
-if($useCache){
-  if($cache.mode -eq 'proxy' -and $cache.proxy){
-    $ChProxy = [string]$cache.proxy
-    Write-Host ('  Using cached channel: system proxy ' + $ChProxy + ' (' + ('{0:N0}' -f [double]$cache.speed) + ' B/s)') -ForegroundColor Green
-  } elseif($cache.mode -eq 'ip' -and $cache.ip){
-    $ChIp = [string]$cache.ip
-    Write-Host ('  Using cached channel: direct IP ' + $ChIp + ' (' + ('{0:N0}' -f [double]$cache.speed) + ' B/s)') -ForegroundColor Green
-  } else {
-    $useCache = $false
-  }
+
+# Probe with the BIGGEST resolved file - small files give misleading
+# throughput on CDN edges (fast start, slow sustained), while the whole
+# download experience depends on sustained speed.
+$probeR = @($resolved | Where-Object { ([string]$_.Url).StartsWith('https://edge.forgecdn.net') } | Sort-Object -Property @{Expression={$_.Len};Descending=$true} | Select-Object -First 1)
+if($probeR.Count -eq 0){ $probeR = @($resolved | Where-Object { $_.Url -ne '' } | Sort-Object -Property @{Expression={$_.Len};Descending=$true} | Select-Object -First 1) }
+$pUrl = ''
+if($probeR.Count -gt 0){
+  $pUrl = [string]$probeR[0].Url
+  if($pUrl -notmatch 'api-key='){ $pUrl += '?api-key=' + $CdnToken }
 }
-if(-not $useCache){
-  # Probe with the BIGGEST resolved file - small files give misleading
-  # throughput on CDN edges (fast start, slow sustained), while the whole
-  # download experience depends on sustained speed.
-  $probeR = @($resolved | Where-Object { ([string]$_.Url).StartsWith('https://edge.forgecdn.net') } | Sort-Object -Property @{Expression={$_.Len};Descending=$true} | Select-Object -First 1)
-  if($probeR.Count -eq 0){ $probeR = @($resolved | Where-Object { $_.Url -ne '' } | Sort-Object -Property @{Expression={$_.Len};Descending=$true} | Select-Object -First 1) }
-  if($probeR.Count -gt 0){
-    $pUrl = [string]$probeR[0].Url
-    if($pUrl -notmatch 'api-key='){ $pUrl += '?api-key=' + $CdnToken }
-    Write-Host '  Probing channels (8s each, parallel):' -ForegroundColor Gray
-    $best = Select-BestChannel $pUrl
-    if($best.Count -gt 0){
-      if($best[0].Id -eq 'PROXY'){
-        $ChProxy = $best[0].Args[1]
-        Write-Host ('  -> Using system proxy: ' + $ChProxy + ' (' + ('{0:N0}' -f $best[0].Speed) + ' B/s)') -ForegroundColor Green
+
+$best = @()
+if($cacheValid -and -not $sysProxyNow){
+  # No proxy + valid direct-IP cache: use it without probing.
+  $ChIp = [string]$cache.ip
+  Write-Host ('  Using cached channel: direct IP ' + $ChIp + ' (' + ('{0:N0}' -f [double]$cache.speed) + ' B/s)') -ForegroundColor Green
+} elseif($pUrl -ne ''){
+  # Probe now. The proxy is always re-tested (it may be off even though the
+  # registry still lists it). With a valid IP cache only [proxy + cached IP]
+  # are tested; otherwise the full IP list is enumerated.
+  Write-Host '  Probing channels (8s each, parallel):' -ForegroundColor Gray
+  $candidates = @()
+  $idx = 0
+  if($sysProxyNow){ $candidates += @{ Id='PROXY'; Args=@('--proxy',$sysProxyNow); Label=$sysProxyNow } }
+  if($cacheValid){
+    $candidates += @{ Id='CIP'; Args=@('--resolve',('edge.forgecdn.net:443:' + $cache.ip)); Label=('cached ' + $cache.ip) }
+  } else {
+    foreach($ip in (Get-DirectIps 'edge.forgecdn.net')){
+      $idx++
+      $candidates += @{ Id=('IP'+$idx); Args=@('--resolve',('edge.forgecdn.net:443:'+$ip)); Label=$ip }
+    }
+  }
+  $best = @(Probe-Channels $candidates $pUrl)
+  if($best.Count -gt 0){
+    if($best[0].Id -eq 'PROXY'){
+      $ChProxy = $best[0].Args[1]
+      Write-Host ('  -> Using system proxy: ' + $ChProxy + ' (' + ('{0:N0}' -f $best[0].Speed) + ' B/s)') -ForegroundColor Green
+      # Proxy results are never cached; drop any stale IP cache so a later
+      # run without the proxy performs a fresh full probe.
+      Remove-ChannelCache
+    } else {
+      if($best[0].Id -eq 'CIP'){
+        $ChIp = [string]$cache.ip
       } else {
         $ChIp = ($best[0].Args[1] -split ':')[-1]
-        Write-Host ('  -> Using direct IP: ' + $ChIp + ' (' + ('{0:N0}' -f $best[0].Speed) + ' B/s)') -ForegroundColor Green
       }
+      Write-Host ('  -> Using direct IP: ' + $ChIp + ' (' + ('{0:N0}' -f $best[0].Speed) + ' B/s)') -ForegroundColor Green
       $cdn = @{
-        mode  = $(if($best[0].Id -eq 'PROXY'){ 'proxy' } else { 'ip' })
-        proxy = $(if($best[0].Id -eq 'PROXY'){ $ChProxy } else { $null })
-        ip    = $(if($best[0].Id -eq 'PROXY'){ $null } else { $ChIp })
+        mode  = 'ip'
+        ip    = $ChIp
         speed = $best[0].Speed
         ts    = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
       }
       Write-ChannelCache $cdn
-      # Channel pool: keep only channels in the same league as the fastest
-      # one (>= 50% of its speed, at least 500 KB/s). Rotating through a
-      # pool that mixes 10 MB/s and 40 KB/s channels would stall half the
-      # downloads; when everything is slow (no proxy), the top channels are
-      # still rotated to spread the risk.
-      $fastest = [double]$best[0].Speed
-      $threshold = [Math]::Max(500000.0, $fastest * 0.5)
-      $ChannelPool = @()
-      foreach($b in $best){
-        if([double]$b.Speed -ge $threshold){ $ChannelPool += @{ Id=$b.Id; Args=$b.Args; Fails=0 } }
-      }
-      if($ChannelPool.Count -eq 0 -and $best.Count -gt 0){
-        $ChannelPool += @{ Id=$best[0].Id; Args=$best[0].Args; Fails=0 }
-      }
-      $PoolIdx = 0
-    } else {
-      Write-Host '  All channels failed - using the default direct connection.' -ForegroundColor Yellow
-      $ChannelPool = @()
     }
+    # Channel pool: keep only channels in the same league as the fastest
+    # one (>= 50% of its speed, at least 500 KB/s). Rotating through a
+    # pool that mixes 10 MB/s and 40 KB/s channels would stall half the
+    # downloads; when everything is slow (no proxy), the top channels are
+    # still rotated to spread the risk.
+    $fastest = [double]$best[0].Speed
+    $threshold = [Math]::Max(500000.0, $fastest * 0.5)
+    foreach($b in $best){
+      if([double]$b.Speed -ge $threshold){ $ChannelPool += @{ Id=$b.Id; Args=$b.Args; Fails=0 } }
+    }
+    if($ChannelPool.Count -eq 0){ $ChannelPool += @{ Id=$best[0].Id; Args=$best[0].Args; Fails=0 } }
+    $PoolIdx = 0
   } else {
-    Write-Host '  Nothing to probe - using the default direct connection.' -ForegroundColor Yellow
-    $ChannelPool = @()
+    Write-Host '  All channels failed - using the default direct connection.' -ForegroundColor Yellow
+    Remove-ChannelCache
   }
 } else {
-  # Cache hit: single-channel pool (a fresh probe happens after the TTL).
-  $ChannelPool = @()
-  if($ChProxy){ $ChannelPool += @{ Id='PROXY'; Args=@('--proxy',$ChProxy); Fails=0 } }
-  elseif($ChIp){ $ChannelPool += @{ Id='IP'; Args=@('--resolve',('edge.forgecdn.net:443:' + $ChIp)); Fails=0 } }
-  $PoolIdx = 0
+  Write-Host '  Nothing to probe - using the default direct connection.' -ForegroundColor Yellow
 }
 
 # Rotate through the channel pool; returns the curl args for the next
@@ -765,6 +778,7 @@ $active    = @{}
 $doneBytes = [long]0
 $doneCount = 0
 $gaveUp    = New-Object System.Collections.Generic.List[object]
+$consecDlFail = 0
 
 while($queue.Count -gt 0 -or $active.Count -gt 0){
   while($active.Count -lt $Concurrency -and $queue.Count -gt 0){
@@ -785,7 +799,17 @@ while($queue.Count -gt 0 -or $active.Count -gt 0){
       if($ok){
         $doneBytes += $size
         $doneCount++
+        $consecDlFail = 0
       } else {
+        $consecDlFail++
+        if($consecDlFail -ge 3){
+          # The active channel looks dead (proxy turned off, node dropped).
+          # Drop the pool + cache and continue on the plain default route.
+          Show-Info 'Channel appears down (3 consecutive failures) - switching to the default direct route ...' 'Yellow'
+          $ChannelPool = @()
+          Remove-ChannelCache
+          $consecDlFail = 0
+        }
         if(Test-Path -LiteralPath $key){ Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue }
         if($a.Item.Tries -lt 3){
           $a.Item.Tries++
