@@ -125,8 +125,6 @@ $SodRepos = @(
   @{ Repo = 'WhisperPop-SoD';       Folder = 'WhisperPop'      }
 )
 
-# Not from CurseForge - left untouched on disk
-$External = @('MYStats')
 # ------------------------------- helpers ------------------------------------
 # Animated spinner character shown at the head of every progress-bar row.
 $script:SpinIdx = 0
@@ -454,7 +452,6 @@ Write-Host '================================================================' -F
 Write-Host ('  Target directory : ' + $DeployDir)
 Write-Host ('  CurseForge addons: ' + $Projects.Count + ' projects')
 Write-Host ('  Own SoD addons   : ' + $SodRepos.Count + ' repositories')
-Write-Host ('  External (skip)  : ' + ($External -join ', '))
 Write-Host ''
 
 $checkDir = $ScriptDir
@@ -1222,7 +1219,6 @@ Write-Host ('  SoD addons OK   : ' + $sodOk.Count + '/' + $SodRepos.Count) -Fore
 if($sodFail.Count -gt 0){
   Write-Host ('  SoD FAILED      : ' + ($sodFail -join ', ')) -ForegroundColor Red
 }
-Write-Host ('  Kept untouched  : ' + ($External -join ', ')) -ForegroundColor Gray
 Write-Host '  Downloaded zip files have been removed.' -ForegroundColor Gray
 Write-Host ''
 Read-Host '  Press Enter to exit' | Out-Null
