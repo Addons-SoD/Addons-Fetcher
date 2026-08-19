@@ -6,12 +6,22 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$env:DEPLOY_SELF='%~
 exit /b %ERRORLEVEL%
 #PSSTART
 # ============================================================================
-#  WoW Classic Era - AddOns one-click deployment script  (v2 - fast channel)
+#  WoW Classic Era - AddOns one-click deployment script  (v3)
 #  - Downloads all CurseForge addons listed below (latest Classic Era file)
-#  - Copies the *-SoD addons from the local git workspace (GitHub fallback)
+#  - Downloads the *-SoD addons from GitHub (source archive zip; works on
+#    any machine, no local git workspace required)
 #  - Extracts everything into the 'Addons' subfolder next to THIS script
 #    (put this script into the 'Interface' folder and run it there)
 #  - Deletes all downloaded zip files when finished
+#  v3 changes:
+#  * SoD addons are always fetched from GitHub (github.com archive ->
+#    codeload direct -> api.github.com tarball), with a proxy-vs-direct
+#    channel probe when a proxy is available.
+#  * Slow-download guard: a transfer averaging below 50 KB/s is killed and
+#    retried on another channel; after 3 slow kills the CDN channels are
+#    re-probed and the fastest one is picked again.
+#  * The progress bar now shows the live overall throughput (MB/s).
+#  * Extraction parallelism = logical CPU cores - 2 (min 1).
 #  v2 changes:
 #  * Smart channel selection: detects the Windows system proxy, enumerates
 #    multiple CDN IPs (system DNS + AliDNS), speed-tests every candidate in
@@ -45,7 +55,6 @@ $Referer     = 'https://www.curseforge.com/wow/addons'
 $ApiBase     = 'https://www.curseforge.com/api/v1'
 $CoreBase    = 'https://api.curseforge.com/v1'
 $CfApiKey    = '$2a$10$bL4bIL5pUWqfcO7KQtnMReakwtfHbNKh6v1uTpKlzhwoueEJQnPnm'
-$RepoRoot    = (Join-Path $env:USERPROFILE 'WorkSpace\Github')
 $GhUser      = 'Addons-SoD'
 $Concurrency = 8
 $SilenceSec   = 180
@@ -382,10 +391,11 @@ function Test-ZipFile($path){
   }catch{ return $false }
 }
 
-function Invoke-CurlDownload($url,$outFile,$timeoutSec){
-  $extra = @()
-  if($ChProxy){ $extra += @('--proxy',$ChProxy) }
-  & curl.exe -s -L --fail --retry 3 --retry-delay 2 --connect-timeout 30 --max-time $timeoutSec -A $Ua -e $Referer @extra -o $outFile $url
+function Invoke-CurlDownload($url,$outFile,$timeoutSec,[string[]]$extraArgs){
+  $a = @('-s','-L','--fail','--retry','3','--retry-delay','2','--connect-timeout','15','--max-time',$timeoutSec,'-A',$Ua,'-e',$Referer)
+  if($extraArgs){ $a += $extraArgs }
+  $a += @('-o',$outFile,$url)
+  & curl.exe @a
   return ($LASTEXITCODE -eq 0)
 }
 
@@ -621,9 +631,11 @@ if($null -ne $cache -and $cache.mode -eq 'ip' -and $cache.ip -and $cache.ts){
 $probeR = @($resolved | Where-Object { ([string]$_.Url).StartsWith('https://edge.forgecdn.net') } | Sort-Object -Property @{Expression={$_.Len};Descending=$true} | Select-Object -First 1)
 if($probeR.Count -eq 0){ $probeR = @($resolved | Where-Object { $_.Url -ne '' } | Sort-Object -Property @{Expression={$_.Len};Descending=$true} | Select-Object -First 1) }
 $pUrl = ''
+$ReselectUrl = ''
 if($probeR.Count -gt 0){
   $pUrl = [string]$probeR[0].Url
   if($pUrl -notmatch 'api-key='){ $pUrl += '?api-key=' + $CdnToken }
+  $ReselectUrl = $pUrl
 }
 
 $best = @()
@@ -779,16 +791,84 @@ $doneBytes = [long]0
 $doneCount = 0
 $gaveUp    = New-Object System.Collections.Generic.List[object]
 $consecDlFail = 0
+# Slow-download guard: a file averaging below $MinDlSpeed after
+# $SlowCheckSec is killed and retried on another channel; after
+# $ReselectThresh slow kills the CDN channels are re-probed from scratch.
+$MinDlSpeed     = 50KB
+$SlowCheckSec   = 10
+$ReselectThresh = 3
+$slowKills      = 0
+# Smoothed overall throughput for the progress bar.
+$emaSpeed   = 0.0
+$lastBytes  = [long]0
+$lastSpeedT = Get-Date
 
 while($queue.Count -gt 0 -or $active.Count -gt 0){
   while($active.Count -lt $Concurrency -and $queue.Count -gt 0){
     $it = $queue.Dequeue()
     $curlArgs = @('-s','-L','--fail','--retry','2','--retry-delay','3','--connect-timeout','30','--max-time','7200','-A',$Ua,'-o',$it.ZipPath) + (Get-NextChannelArgs) + @($it.DlUrl)
     $proc = Start-CurlProc $curlArgs $null
-    $active[$it.ZipPath] = @{ Proc = $proc; Item = $it }
+    $active[$it.ZipPath] = @{ Proc = $proc; Item = $it; Start = Get-Date }
     if($queue.Count -gt 0){ Start-Sleep -Milliseconds (Get-Random -Minimum 50 -Maximum 150) }
   }
   Start-Sleep -Milliseconds 400
+  # Slow-download guard: kill stalled transfers and retry on another channel.
+  foreach($key in @($active.Keys)){
+    $a = $active[$key]
+    if(-not $a.Proc.HasExited){
+      $elapsed = ((Get-Date) - $a.Start).TotalSeconds
+      if($elapsed -gt $SlowCheckSec){
+        $sz = [long]0
+        if(Test-Path -LiteralPath $key){ $sz = (Get-Item -LiteralPath $key).Length }
+        $avg = $sz / $elapsed
+        if($avg -lt $MinDlSpeed){
+          $slowKills++
+          Show-Info ($a.Item.Name + ': download too slow (' + ('{0:N0}' -f $avg) + ' B/s) - killing, retrying on another channel') 'Yellow'
+          Stop-Process -Id $a.Proc.Id -Force -ErrorAction SilentlyContinue
+          if(Test-Path -LiteralPath $key){ Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue }
+          if($a.Item.Tries -lt 3){
+            $a.Item.Tries++
+            $queue.Enqueue($a.Item)
+          } else {
+            $gaveUp.Add($a.Item) | Out-Null
+          }
+          $active.Remove($key)
+          if($slowKills -ge $ReselectThresh){
+            $slowKills = 0
+            Show-Info 'Speed too low on multiple files - re-selecting the fastest CDN channel ...' 'Yellow'
+            if($ReselectUrl){
+              $candidates = @()
+              $sp = Get-SystemProxy
+              if($sp){ $candidates += @{ Id='PROXY'; Args=@('--proxy',$sp); Label=$sp } }
+              $ridx = 0
+              foreach($ip in (Get-DirectIps 'edge.forgecdn.net')){
+                $ridx++
+                $candidates += @{ Id=('IP'+$ridx); Args=@('--resolve',('edge.forgecdn.net:443:'+$ip)); Label=$ip }
+              }
+              if($candidates.Count -gt 0){
+                $rbest = @(Probe-Channels $candidates $ReselectUrl)
+                $ChannelPool = @()
+                if($rbest.Count -gt 0){
+                  $rfast = [double]$rbest[0].Speed
+                  $rthr  = [Math]::Max(500000.0, $rfast * 0.5)
+                  foreach($b in $rbest){ if([double]$b.Speed -ge $rthr){ $ChannelPool += @{ Id=$b.Id; Args=$b.Args; Fails=0 } } }
+                  if($ChannelPool.Count -eq 0){ $ChannelPool += @{ Id=$rbest[0].Id; Args=$rbest[0].Args; Fails=0 } }
+                  $PoolIdx = 0
+                  if($rbest[0].Id -eq 'PROXY'){
+                    Write-Host ('    -> re-selected proxy ' + $rbest[0].Args[1] + ' (' + ('{0:N0}' -f $rbest[0].Speed) + ' B/s)') -ForegroundColor Green
+                  } else {
+                    Write-Host ('    -> re-selected direct IP ' + (($rbest[0].Args[1] -split ':')[-1]) + ' (' + ('{0:N0}' -f $rbest[0].Speed) + ' B/s)') -ForegroundColor Green
+                  }
+                } else {
+                  Write-Host '    -> all channels failed, continuing on the default route' -ForegroundColor Yellow
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
   foreach($key in @($active.Keys)){
     $a = $active[$key]
     if($a.Proc.HasExited){
@@ -831,7 +911,20 @@ while($queue.Count -gt 0 -or $active.Count -gt 0){
   $ratio  = ($doneBytes + $curBytes) / $totalBytes
   $mbDone = [Math]::Round(($doneBytes + $curBytes) / 1MB, 1)
   $mbAll  = [Math]::Round($totalBytes / 1MB, 1)
-  Show-Bar $ratio ('downloading ' + $mbDone + '/' + $mbAll + ' MB | done ' + $doneCount + '/' + ($doneCount + $remain) + ' | pending ' + $remain)
+  # Smoothed throughput display.
+  $nowBytes = $doneBytes + $curBytes
+  $dt = ((Get-Date) - $lastSpeedT).TotalSeconds
+  if($dt -ge 0.8){
+    if($lastBytes -gt 0){
+      $inst = ($nowBytes - $lastBytes) / $dt
+      if($emaSpeed -eq 0){ $emaSpeed = $inst } else { $emaSpeed = ($emaSpeed * 0.7) + ($inst * 0.3) }
+    }
+    $lastBytes = $nowBytes
+    $lastSpeedT = Get-Date
+  }
+  $spdTxt = '--'
+  if($emaSpeed -gt 0){ $spdTxt = ('{0:N1} MB/s' -f ($emaSpeed / 1MB)) }
+  Show-Bar $ratio ('downloading ' + $mbDone + '/' + $mbAll + ' MB @ ' + $spdTxt + ' | done ' + $doneCount + '/' + ($doneCount + $remain) + ' | pending ' + $remain)
 }
 Finish-Line
 
@@ -868,7 +961,10 @@ $zips = @($resolved | Where-Object { (Test-Path -LiteralPath $_.ZipPath) -and -n
 
 $tarCmd = $null
 try { if(Get-Command tar.exe -ErrorAction Stop){ $tarCmd = 'tar.exe' } } catch {}
-$tarWorkers = 4
+# Extraction parallelism scales with the machine: logical cores - 2 (min 1).
+$cores = [Environment]::ProcessorCount
+$tarWorkers = [Math]::Max(1, $cores - 2)
+Write-Host ('  Extraction workers: ' + $tarWorkers + ' (CPU cores ' + $cores + ' - 2)') -ForegroundColor Gray
 $tarQueue = New-Object System.Collections.Generic.Queue[object]
 foreach($r in $zips){ $tarQueue.Enqueue($r) | Out-Null }
 $tActive = @{}
@@ -945,46 +1041,91 @@ while($tarQueue.Count -gt 0 -or $tActive.Count -gt 0){
 Finish-Line
 
 # ------------------------- phase 5: own SoD addons --------------------------
+# The *-SoD addons are ALWAYS downloaded from GitHub (source archive zip),
+# so the script works identically on any machine - no local git workspace
+# is used. Sources per repo/branch, in order:
+#   1. codeload.github.com/.../zip/...      (direct, no redirect - fastest)
+#   2. github.com/.../archive/...zip        (302 -> codeload)
+#   3. api.github.com/.../tarball/...       (tar.gz fallback)
 Write-Host ''
-Write-Host '[5/5] Deploying own SoD addons from git workspace ...' -ForegroundColor Green
+Write-Host '[5/5] Downloading own SoD addons from GitHub ...' -ForegroundColor Green
 $sodOk   = New-Object System.Collections.Generic.List[string]
 $sodFail = New-Object System.Collections.Generic.List[string]
+
+# GitHub channel: codeload.github.com is a different host than the CurseForge
+# CDN, so when a proxy is in use for CurseForge we compare proxy vs direct
+# for GitHub too. Without a proxy, plain direct is used (codeload is directly
+# reachable).
+$GhArgs = @()
+if($ChProxy -and $SodRepos.Count -gt 0){
+  $ghProbeUrl = 'https://codeload.github.com/' + $GhUser + '/' + $SodRepos[0].Repo + '/zip/refs/heads/main'
+  $candidates = @()
+  $candidates += @{ Id='PROXY'; Args=@('--proxy',$ChProxy); Label='proxy ' + $ChProxy }
+  $candidates += @{ Id='DIRECT'; Args=@(); Label='direct' }
+  Write-Host '  Probing GitHub channel (8s each, parallel):' -ForegroundColor Gray
+  $ghBest = @(Probe-Channels $candidates $ghProbeUrl)
+  if($ghBest.Count -gt 0 -and $ghBest[0].Id -eq 'PROXY'){
+    $GhArgs = @('--proxy',$ChProxy)
+    Write-Host ('  -> GitHub via proxy: ' + $ChProxy + ' (' + ('{0:N0}' -f $ghBest[0].Speed) + ' B/s)') -ForegroundColor Green
+  } else {
+    Write-Host '  -> GitHub via direct connection.' -ForegroundColor Green
+  }
+} else {
+  Write-Host '  GitHub via direct connection.' -ForegroundColor Gray
+}
+
 $i = 0
 foreach($s in $SodRepos){
   $i++
-  Show-Bar ($i / $SodRepos.Count) ('deploying ' + $s.Folder + ' (' + $i + '/' + $SodRepos.Count + ')')
+  Show-Bar ($i / $SodRepos.Count) ('downloading ' + $s.Folder + ' (' + $i + '/' + $SodRepos.Count + ')')
   $target = Join-Path $DeployDir $s.Folder
-  $src    = Join-Path $RepoRoot $s.Repo
   $done   = $false
-  if(Test-Path -LiteralPath $src){
-    try{
-      if(Test-Path -LiteralPath $target){ Remove-Item -LiteralPath $target -Recurse -Force }
-      New-Item -ItemType Directory -Force -Path $target | Out-Null
-      & robocopy $src $target /E /XD .git .vscode .github /XF .gitignore /NFL /NDL /NJH /NJS /NP | Out-Null
-      if($LASTEXITCODE -lt 8){ $done = $true }
-    }catch{}
-  }
-  if(-not $done){
-    $ghOk = $false
-    foreach($branch in 'main','master'){
-      $zip = Join-Path $DlDir ($s.Repo + '-' + $branch + '.zip')
-      $url = 'https://github.com/' + $GhUser + '/' + $s.Repo + '/archive/refs/heads/' + $branch + '.zip'
-      if(Invoke-CurlDownload $url $zip 600){
+  foreach($branch in 'main','master'){
+    $zip = Join-Path $DlDir ($s.Repo + '-' + $branch + '.zip')
+    $urls = @(
+      ('https://codeload.github.com/' + $GhUser + '/' + $s.Repo + '/zip/refs/heads/' + $branch),
+      ('https://github.com/' + $GhUser + '/' + $s.Repo + '/archive/refs/heads/' + $branch + '.zip'),
+      ('https://api.github.com/repos/' + $GhUser + '/' + $s.Repo + '/tarball/' + $branch)
+    )
+    foreach($url in $urls){
+      $dlSw = [Diagnostics.Stopwatch]::StartNew()
+      if(Invoke-CurlDownload $url $zip 300 $GhArgs){
+        $dlSw.Stop()
         $stage = Join-Path $Work ('sod_' + [Guid]::NewGuid().ToString('N').Substring(0,8))
+        New-Item -ItemType Directory -Force -Path $stage | Out-Null
+        $unpackOk = $false
         try{
-          Expand-Archive -LiteralPath $zip -DestinationPath $stage -Force
+          if($tarCmd){
+            $argLine = Get-CurlArgLine @('-xf',$zip,'-C',$stage)
+            $tp = Start-Process -FilePath $tarCmd -ArgumentList $argLine -PassThru -WindowStyle Hidden
+            $tp.WaitForExit(120000)
+            if($tp.ExitCode -eq 0){ $unpackOk = $true }
+          }
+          if(-not $unpackOk){
+            Expand-Archive -LiteralPath $zip -DestinationPath $stage -Force
+            $unpackOk = $true
+          }
+        }catch{}
+        if($unpackOk){
           $inner = @(Get-ChildItem -LiteralPath $stage -Directory) | Select-Object -First 1
           if($inner){
             if(Test-Path -LiteralPath $target){ Remove-Item -LiteralPath $target -Recurse -Force }
             Move-Item -LiteralPath $inner.FullName -Destination $target -Force
-            $ghOk = $true
+            $done = $true
           }
-        }catch{}
-        if(Test-Path -LiteralPath $stage){ Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
-        if($ghOk){ break }
+        }
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        if($done){
+          $sz = [long]0
+          if(Test-Path -LiteralPath $zip){ $sz = (Get-Item -LiteralPath $zip).Length }
+          $spd = 0.0
+          if($dlSw.Elapsed.TotalSeconds -gt 0){ $spd = $sz / $dlSw.Elapsed.TotalSeconds }
+          Write-Host ('    OK: ' + $s.Folder + ' (' + ('{0:N1}' -f ($sz/1KB)) + ' KB @ ' + ('{0:N1}' -f ($spd/1KB)) + ' KB/s)') -ForegroundColor Green
+          break
+        }
       }
     }
-    if($ghOk){ $done = $true }
+    if($done){ break }
   }
   if($done){ $sodOk.Add($s.Folder) | Out-Null } else { $sodFail.Add($s.Folder) | Out-Null }
 }
