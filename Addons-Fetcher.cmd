@@ -1090,9 +1090,12 @@ if($ChProxy -and $SodRepos.Count -gt 0){
 $i = 0
 foreach($s in $SodRepos){
   $i++
-  Show-Bar ($i / $SodRepos.Count) ('downloading ' + $s.Folder + ' (' + $i + '/' + $SodRepos.Count + ')')
+  # A single progress bar runs through the whole phase; the text is updated
+  # in place as each repo is fetched (no per-repo lines).
+  Show-Bar (($i - 1) / $SodRepos.Count) ('downloading ' + $s.Folder + ' (' + $i + '/' + $SodRepos.Count + ')')
   $target = Join-Path $DeployDir $s.Folder
   $done   = $false
+  $dlInfo = ''
   foreach($branch in 'main','master'){
     $zip = Join-Path $DlDir ($s.Repo + '-' + $branch + '.zip')
     $urls = @(
@@ -1111,7 +1114,7 @@ foreach($s in $SodRepos){
           if($tarCmd){
             $argLine = Get-CurlArgLine @('-xf',$zip,'-C',$stage)
             $tp = Start-Process -FilePath $tarCmd -ArgumentList $argLine -PassThru -WindowStyle Hidden
-            $tp.WaitForExit(120000)
+            $null = $tp.WaitForExit(120000)
             if($tp.ExitCode -eq 0){ $unpackOk = $true }
           }
           if(-not $unpackOk){
@@ -1133,14 +1136,20 @@ foreach($s in $SodRepos){
           if(Test-Path -LiteralPath $zip){ $sz = (Get-Item -LiteralPath $zip).Length }
           $spd = 0.0
           if($dlSw.Elapsed.TotalSeconds -gt 0){ $spd = $sz / $dlSw.Elapsed.TotalSeconds }
-          Write-Host ('    OK: ' + $s.Folder + ' (' + ('{0:N1}' -f ($sz/1KB)) + ' KB @ ' + ('{0:N1}' -f ($spd/1KB)) + ' KB/s)') -ForegroundColor Green
+          $dlInfo = ('{0:N1} KB @ {1:N1} KB/s' -f ($sz/1KB), ($spd/1KB))
           break
         }
       }
     }
     if($done){ break }
   }
-  if($done){ $sodOk.Add($s.Folder) | Out-Null } else { $sodFail.Add($s.Folder) | Out-Null }
+  if($done){
+    $sodOk.Add($s.Folder) | Out-Null
+    Show-Bar ($i / $SodRepos.Count) ('OK: ' + $s.Folder + ' ' + $dlInfo + ' (' + $i + '/' + $SodRepos.Count + ')')
+  } else {
+    $sodFail.Add($s.Folder) | Out-Null
+    Show-Bar ($i / $SodRepos.Count) ('FAILED: ' + $s.Folder + ' (' + $i + '/' + $SodRepos.Count + ')')
+  }
 }
 Finish-Line
 
