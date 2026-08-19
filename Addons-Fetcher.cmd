@@ -126,6 +126,18 @@ $SodRepos = @(
 )
 
 # ------------------------------- helpers ------------------------------------
+# Console width is kept at 120 columns; long lines are truncated with '...'.
+$ConWidth = 120
+$HLine = '=' * $ConWidth
+
+function Truncate-Text([string]$s,[int]$maxLen){
+  if($s.Length -gt $maxLen){
+    if($maxLen -le 3){ return $s.Substring(0, [Math]::Min($maxLen, $s.Length)) }
+    return $s.Substring(0, $maxLen - 3) + '...'
+  }
+  return $s
+}
+
 # Animated spinner character shown at the head of every progress-bar row.
 $script:SpinIdx = 0
 function Get-SpinChar{
@@ -141,7 +153,7 @@ function Wait-Spin([int]$sec,[string]$msg){
     Start-Sleep -Milliseconds 200
     Write-Host ("`r  " + (Get-SpinChar) + " " + $msg + " (" + [int](($w + 1) / 5) + "s/" + $sec + "s)  ") -NoNewline
   }
-  Write-Host ("`r" + (' ' * 70)) -NoNewline
+  Write-Host ("`r" + (' ' * 120)) -NoNewline
   Write-Host ''
 }
 
@@ -161,21 +173,20 @@ function Show-Bar($ratio,$text){
   $f = [int]([Math]::Round($w * $ratio))
   $bar = ([string][char]0x2588) * $f + ([string][char]0x2591) * ($w - $f)
   $line = "`r " + (Get-SpinChar) + " [" + $bar + "] " + ("{0,3}" -f [int]($ratio*100)) + "%  " + $text
-  if($line.Length -gt 110){ $line = $line.Substring(0,110) }
-  Write-Host ($line.PadRight(110)) -NoNewline
+  if($line.Length -gt $ConWidth){ $line = $line.Substring(0, $ConWidth - 3) + '...' }
+  Write-Host ($line.PadRight($ConWidth)) -NoNewline
 }
 
 function Finish-Line{
   # Carriage-return to the line start, then overwrite the trailing
-  # progress-bar row (110 chars) so the last status text (e.g.
-  # '100% resolving <name>') does not linger on screen.
-  Write-Host ("`r" + (' ' * 110)) -NoNewline
+  # progress-bar row so the last status text does not linger on screen.
+  Write-Host ("`r" + (' ' * $ConWidth)) -NoNewline
   Write-Host ''
 }
 
 function Show-Info($msg,$color){
   Write-Host ''
-  Write-Host ('    ' + $msg) -ForegroundColor $color
+  Write-Host ('    ' + (Truncate-Text $msg ($ConWidth - 4))) -ForegroundColor $color
 }
 
 function Get-StatusCode($err){
@@ -446,10 +457,10 @@ function Invoke-CurlDownload($url,$outFile,$timeoutSec,[string[]]$extraArgs){
 
 # ------------------------------ pre-checks ----------------------------------
 Write-Host ''
-Write-Host '================================================================' -ForegroundColor Cyan
-Write-Host '   World of Warcraft Classic Era - AddOns one-click deploy'      -ForegroundColor Cyan
-Write-Host '================================================================' -ForegroundColor Cyan
-Write-Host ('  Target directory : ' + $DeployDir)
+Write-Host $HLine -ForegroundColor Cyan
+Write-Host ('   World of Warcraft Classic Era - AddOns one-click deploy') -ForegroundColor Cyan
+Write-Host $HLine -ForegroundColor Cyan
+Write-Host (Truncate-Text ('  Target directory : ' + $DeployDir) $ConWidth)
 Write-Host ('  CurseForge addons: ' + $Projects.Count + ' projects')
 Write-Host ('  Own SoD addons   : ' + $SodRepos.Count + ' repositories')
 Write-Host ''
@@ -640,10 +651,10 @@ if($coreFail.Count -gt 0){
 
 Write-Host ('  Resolved ' + $resolved.Count + '/' + $Projects.Count + ' projects:') -ForegroundColor Gray
 foreach($r in $resolved){
-  Write-Host ('    - ' + $r.Name.PadRight(24) + $r.ZipName) -ForegroundColor Gray
+  Write-Host (Truncate-Text ('    - ' + $r.Name.PadRight(24) + $r.ZipName) $ConWidth) -ForegroundColor Gray
 }
 if($resolveFail.Count -gt 0){
-  Write-Host ('  FAILED to resolve: ' + ($resolveFail -join ', ')) -ForegroundColor Red
+  Write-Host (Truncate-Text ('  FAILED to resolve: ' + ($resolveFail -join ', ')) $ConWidth) -ForegroundColor Red
 }
 
 # ------------------ phase 2: select fastest download channel ---------------
@@ -908,7 +919,7 @@ while($queue.Count -gt 0 -or $active.Count -gt 0){
                     if($ChannelPool.Count -eq 0){ $ChannelPool += @{ Id=$rbest[0].Id; Args=$rbest[0].Args; Fails=0 } }
                     $PoolIdx = 0
                     # Clear the progress-bar row first, then report on its own line.
-                    Write-Host ("`r" + (' ' * 110)) -NoNewline
+                    Write-Host ("`r" + (' ' * $ConWidth)) -NoNewline
                     Write-Host ''
                     if($rbest[0].Id -eq 'PROXY'){
                       Write-Host ('    Channel re-selected: proxy ' + $rbest[0].Args[1] + ' (' + ('{0:N0}' -f $rbest[0].Speed) + ' B/s)') -ForegroundColor Green
@@ -916,7 +927,7 @@ while($queue.Count -gt 0 -or $active.Count -gt 0){
                       Write-Host ('    Channel re-selected: direct IP ' + (($rbest[0].Args[1] -split ':')[-1]) + ' (' + ('{0:N0}' -f $rbest[0].Speed) + ' B/s)') -ForegroundColor Green
                     }
                   } else {
-                    Write-Host ("`r" + (' ' * 110)) -NoNewline
+                    Write-Host ("`r" + (' ' * $ConWidth)) -NoNewline
                     Write-Host ''
                     Write-Host '    Channel re-selected: none available - continuing on the default route' -ForegroundColor Yellow
                   }
@@ -1004,7 +1015,7 @@ if($gaveUp.Count -gt 0){
   }
 }
 if($dlFailed.Count -gt 0){
-  Write-Host ('  Download FAILED: ' + (($dlFailed | ForEach-Object { ($_ -replace ' \(no CDN link\)','') }) -join ', ')) -ForegroundColor Red
+  Write-Host (Truncate-Text ('  Download FAILED: ' + (($dlFailed | ForEach-Object { ($_ -replace ' \(no CDN link\)','') }) -join ', ')) $ConWidth) -ForegroundColor Red
 } else {
   Write-Host ('  All ' + $doneCount + ' zip files downloaded.') -ForegroundColor Gray
 }
@@ -1202,22 +1213,22 @@ Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
 
 # ------------------------------- summary ------------------------------------
 Write-Host ''
-Write-Host '================================================================' -ForegroundColor Cyan
+Write-Host $HLine -ForegroundColor Cyan
 Write-Host '  Deployment summary' -ForegroundColor Cyan
-Write-Host '================================================================' -ForegroundColor Cyan
+Write-Host $HLine -ForegroundColor Cyan
 Write-Host ('  CurseForge OK   : ' + $extractOk.Count + '/' + $Projects.Count) -ForegroundColor Green
 if($extractFail.Count -gt 0){
-  Write-Host ('  Extract FAILED  : ' + ($extractFail -join '; ')) -ForegroundColor Red
+  Write-Host (Truncate-Text ('  Extract FAILED  : ' + ($extractFail -join '; ')) $ConWidth) -ForegroundColor Red
 }
 if($resolveFail.Count -gt 0){
-  Write-Host ('  Resolve FAILED  : ' + ($resolveFail -join ', ')) -ForegroundColor Red
+  Write-Host (Truncate-Text ('  Resolve FAILED  : ' + ($resolveFail -join ', ')) $ConWidth) -ForegroundColor Red
 }
 if($dlFailed.Count -gt 0){
-  Write-Host ('  Download FAILED : ' + ($dlFailed -join ', ')) -ForegroundColor Red
+  Write-Host (Truncate-Text ('  Download FAILED : ' + ($dlFailed -join ', ')) $ConWidth) -ForegroundColor Red
 }
 Write-Host ('  SoD addons OK   : ' + $sodOk.Count + '/' + $SodRepos.Count) -ForegroundColor Green
 if($sodFail.Count -gt 0){
-  Write-Host ('  SoD FAILED      : ' + ($sodFail -join ', ')) -ForegroundColor Red
+  Write-Host (Truncate-Text ('  SoD FAILED      : ' + ($sodFail -join ', ')) $ConWidth) -ForegroundColor Red
 }
 Write-Host '  Downloaded zip files have been removed.' -ForegroundColor Gray
 Write-Host ''
