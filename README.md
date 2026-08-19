@@ -11,9 +11,9 @@ One-click deployment script for World of Warcraft Classic Era (1.15.x client) ad
   [Addons-SoD](https://github.com/Addons-SoD) account directly from GitHub as
   source archive zips (works identically on every machine - no local git
   workspace required).
-- Extracts everything into the `Addons` subfolder next to the script. The
+- Extracts everything into the `AddOns` subfolder next to the script. The
   script is meant to live in the `Interface` folder, so addons land in
-  `...\_classic_era_\Interface\Addons` (i.e. the game's `AddOns` directory).
+  `...\_classic_era_\Interface\AddOns` (i.e. the game's `AddOns` directory).
 - Deletes all downloaded zip files when finished.
 
 ## Smart download channels (v2)
@@ -57,7 +57,7 @@ runs it.
 
 ### Running from a clone
 
-The repository ignores the `Addons/` folder, so you can also clone this
+The repository ignores the `AddOns/` folder, so you can also clone this
 repository directly into your `Interface` folder, keep it up to date with
 `git pull`, and run `Addons-Fetcher.cmd` from there.
 
