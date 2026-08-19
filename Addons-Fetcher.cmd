@@ -128,6 +128,25 @@ $SodRepos = @(
 # Not from CurseForge - left untouched on disk
 $External = @('MYStats')
 # ------------------------------- helpers ------------------------------------
+# Animated spinner character shown at the head of every progress-bar row.
+$script:SpinIdx = 0
+function Get-SpinChar{
+  $script:SpinIdx = ($script:SpinIdx + 1) % 4
+  return ('-','\','|','/')[$script:SpinIdx]
+}
+
+# Blocking wait with an animated spinner on its own row (used for the long
+# silent cooldowns so the console does not look frozen).
+function Wait-Spin([int]$sec,[string]$msg){
+  $steps = $sec * 5
+  for($w = 0; $w -lt $steps; $w++){
+    Start-Sleep -Milliseconds 200
+    Write-Host ("`r  " + (Get-SpinChar) + " " + $msg + " (" + [int](($w + 1) / 5) + "s/" + $sec + "s)  ") -NoNewline
+  }
+  Write-Host ("`r" + (' ' * 70)) -NoNewline
+  Write-Host ''
+}
+
 function Test-Writable($dir){
   try{
     $t = Join-Path $dir ('.wt_' + [Guid]::NewGuid().ToString('N'))
@@ -143,7 +162,7 @@ function Show-Bar($ratio,$text){
   $w = 30
   $f = [int]([Math]::Round($w * $ratio))
   $bar = ([string][char]0x2588) * $f + ([string][char]0x2591) * ($w - $f)
-  $line = "`r  [" + $bar + "] " + ("{0,3}" -f [int]($ratio*100)) + "%  " + $text
+  $line = "`r " + (Get-SpinChar) + " [" + $bar + "] " + ("{0,3}" -f [int]($ratio*100)) + "%  " + $text
   if($line.Length -gt 110){ $line = $line.Substring(0,110) }
   Write-Host ($line.PadRight(110)) -NoNewline
 }
@@ -223,7 +242,9 @@ function Get-DirectIps([string]$hostName){
 # small files give misleading results on CDN edges) and return the fastest
 # channels sorted, best first (max 3). Each candidate: @{ Id; Args; Label };
 # each result: @{ Id; Speed; Args; Label }.
-function Probe-Channels($candidates,[string]$probeUrl){
+# -Quiet suppresses all console output (used for mid-download re-probes so
+# the progress bar is not broken up by the probe lines).
+function Probe-Channels($candidates,[string]$probeUrl,[switch]$Quiet){
   if($null -eq $candidates -or @($candidates).Count -eq 0){ return @() }
   $tmp = Join-Path $Work 'probe'
   New-Item -ItemType Directory -Force -Path $tmp | Out-Null
@@ -236,7 +257,16 @@ function Probe-Channels($candidates,[string]$probeUrl){
     $p = Start-CurlProc $a $outFile
     $procs += @{ Ch = $ch; Proc = $p; Out = $outFile }
   }
-  while(@($procs | Where-Object { -not $_.Proc.HasExited }).Count -gt 0){ Start-Sleep -Milliseconds 300 }
+  while(@($procs | Where-Object { -not $_.Proc.HasExited }).Count -gt 0){
+    if(-not $Quiet){
+      Write-Host ("`r  " + (Get-SpinChar) + ' probing channels ...') -NoNewline
+    }
+    Start-Sleep -Milliseconds 300
+  }
+  if(-not $Quiet){
+    Write-Host ("`r" + (' ' * 30)) -NoNewline
+    Write-Host ''
+  }
   Start-Sleep -Milliseconds 200
   $okList = New-Object System.Collections.Generic.List[object]
   foreach($pr in $procs){
@@ -248,10 +278,14 @@ function Probe-Channels($candidates,[string]$probeUrl){
       }
     }catch{}
     if($spd -gt 0){
-      Write-Host ('    ' + $pr.Ch.Id.PadRight(7) + ' ' + $pr.Ch.Label.PadRight(22) + ('{0,9:N0}' -f $spd) + ' B/s') -ForegroundColor Gray
+      if(-not $Quiet){
+        Write-Host ('    ' + $pr.Ch.Id.PadRight(7) + ' ' + $pr.Ch.Label.PadRight(22) + ('{0,9:N0}' -f $spd) + ' B/s') -ForegroundColor Gray
+      }
       $okList.Add(@{ Id=$pr.Ch.Id; Speed=$spd; Args=$pr.Ch.Args; Label=$pr.Ch.Label }) | Out-Null
     } else {
-      Write-Host ('    ' + $pr.Ch.Id.PadRight(7) + ' ' + $pr.Ch.Label.PadRight(22) + '    FAILED') -ForegroundColor DarkGray
+      if(-not $Quiet){
+        Write-Host ('    ' + $pr.Ch.Id.PadRight(7) + ' ' + $pr.Ch.Label.PadRight(22) + '    FAILED') -ForegroundColor DarkGray
+      }
     }
   }
   Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
@@ -565,7 +599,7 @@ if($coreFail.Count -gt 0){
     for($pass = 1; $pass -le 2 -and $pending2.Count -gt 0; $pass++){
       if($pass -eq 2){
         Show-Info ('Second pass: retrying ' + $pending2.Count + ' blocked projects after a ' + $SilenceSec + 's silence ...') 'Yellow'
-        Start-Sleep -Seconds $SilenceSec
+        Wait-Spin $SilenceSec 'cooling down (Cloudflare)'
       }
       $stillFail2 = New-Object System.Collections.Generic.List[object]
       $consecFail = 0
@@ -581,7 +615,7 @@ if($coreFail.Count -gt 0){
           if($pass -eq 1){ $stillFail2.Add($p) | Out-Null } else { $resolveFail.Add($p.Name) | Out-Null }
           if($consecFail -eq 3 -and $i -lt $pending2.Count){
             Show-Info ('Cloudflare is challenging us - going silent for ' + $SilenceSec + 's ...') 'Yellow'
-            Start-Sleep -Seconds $SilenceSec
+            Wait-Spin $SilenceSec 'cooling down (Cloudflare)'
             $consecFail = 0
           }
         } else {
@@ -741,7 +775,7 @@ if($cdnPending.Count -gt 0){
   for($pass = 1; $pass -le 2 -and $cdnPending.Count -gt 0; $pass++){
     if($pass -eq 2){
       Show-Info ('Second pass: retrying ' + $cdnPending.Count + ' CDN links after a ' + $SilenceSec + 's silence ...') 'Yellow'
-      Start-Sleep -Seconds $SilenceSec
+      Wait-Spin $SilenceSec 'cooling down (CDN)'
     }
     $stillFail  = New-Object System.Collections.Generic.List[object]
     $consecFail = 0
@@ -771,7 +805,7 @@ if($cdnPending.Count -gt 0){
         if($pass -eq 1){ $stillFail.Add($r) | Out-Null } else { $dlFailedEarly = $true }
         if($consecFail -eq 3 -and $i -lt $cdnPending.Count){
           Show-Info ('CDN lookup keeps failing - going silent for ' + $CdnSilenceSec + 's ...') 'Yellow'
-          Start-Sleep -Seconds $SilenceSec
+          Wait-Spin $SilenceSec 'cooling down (CDN)'
           $consecFail = 0
         }
       }
@@ -810,7 +844,9 @@ $consecDlFail = 0
 $MinDlSpeed     = 50KB
 $SlowCheckSec   = 10
 $ReselectThresh = 3
+$ReselectCooldown = 60
 $slowKills      = 0
+$lastReselect   = (Get-Date).AddSeconds(-999)
 # Smoothed overall throughput for the progress bar.
 $emaSpeed   = 0.0
 $lastBytes  = [long]0
@@ -836,7 +872,8 @@ while($queue.Count -gt 0 -or $active.Count -gt 0){
         $avg = $sz / $elapsed
         if($avg -lt $MinDlSpeed){
           $slowKills++
-          Show-Info ($a.Item.Name + ': download too slow (' + ('{0:N0}' -f $avg) + ' B/s) - killing, retrying on another channel') 'Yellow'
+          # Silent restart: the item goes back into the queue on another
+          # channel; the progress bar keeps running untouched.
           Stop-Process -Id $a.Proc.Id -Force -ErrorAction SilentlyContinue
           if(Test-Path -LiteralPath $key){ Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue }
           if($a.Item.Tries -lt 3){
@@ -848,32 +885,44 @@ while($queue.Count -gt 0 -or $active.Count -gt 0){
           $active.Remove($key)
           if($slowKills -ge $ReselectThresh){
             $slowKills = 0
-            Show-Info 'Speed too low on multiple files - re-selecting the fastest CDN channel ...' 'Yellow'
-            if($ReselectUrl){
-              $candidates = @()
-              $sp = Get-SystemProxy
-              if($sp){ $candidates += @{ Id='PROXY'; Args=@('--proxy',$sp); Label=$sp } }
-              $ridx = 0
-              foreach($ip in (Get-DirectIps 'edge.forgecdn.net')){
-                $ridx++
-                $candidates += @{ Id=('IP'+$ridx); Args=@('--resolve',('edge.forgecdn.net:443:'+$ip)); Label=$ip }
-              }
-              if($candidates.Count -gt 0){
-                $rbest = @(Probe-Channels $candidates $ReselectUrl)
-                $ChannelPool = @()
-                if($rbest.Count -gt 0){
-                  $rfast = [double]$rbest[0].Speed
-                  $rthr  = [Math]::Max(500000.0, $rfast * 0.5)
-                  foreach($b in $rbest){ if([double]$b.Speed -ge $rthr){ $ChannelPool += @{ Id=$b.Id; Args=$b.Args; Fails=0 } } }
-                  if($ChannelPool.Count -eq 0){ $ChannelPool += @{ Id=$rbest[0].Id; Args=$rbest[0].Args; Fails=0 } }
-                  $PoolIdx = 0
-                  if($rbest[0].Id -eq 'PROXY'){
-                    Write-Host ('    -> re-selected proxy ' + $rbest[0].Args[1] + ' (' + ('{0:N0}' -f $rbest[0].Speed) + ' B/s)') -ForegroundColor Green
+            # Cooldown: do not re-probe more than once per $ReselectCooldown
+            # seconds - a flaky network would otherwise trigger re-selects
+            # in a tight loop.
+            if(((Get-Date) - $lastReselect).TotalSeconds -ge $ReselectCooldown){
+              $lastReselect = Get-Date
+              if($ReselectUrl){
+                $candidates = @()
+                $sp = Get-SystemProxy
+                if($sp){ $candidates += @{ Id='PROXY'; Args=@('--proxy',$sp); Label=$sp } }
+                $ridx = 0
+                foreach($ip in (Get-DirectIps 'edge.forgecdn.net')){
+                  $ridx++
+                  $candidates += @{ Id=('IP'+$ridx); Args=@('--resolve',('edge.forgecdn.net:443:'+$ip)); Label=$ip }
+                }
+                if($candidates.Count -gt 0){
+                  # Quiet probe so the progress bar is not broken up; the
+                  # result is reported on a single clean line.
+                  $rbest = @(Probe-Channels $candidates $ReselectUrl -Quiet)
+                  $ChannelPool = @()
+                  if($rbest.Count -gt 0){
+                    $rfast = [double]$rbest[0].Speed
+                    $rthr  = [Math]::Max(500000.0, $rfast * 0.5)
+                    foreach($b in $rbest){ if([double]$b.Speed -ge $rthr){ $ChannelPool += @{ Id=$b.Id; Args=$b.Args; Fails=0 } } }
+                    if($ChannelPool.Count -eq 0){ $ChannelPool += @{ Id=$rbest[0].Id; Args=$rbest[0].Args; Fails=0 } }
+                    $PoolIdx = 0
+                    # Clear the progress-bar row first, then report on its own line.
+                    Write-Host ("`r" + (' ' * 110)) -NoNewline
+                    Write-Host ''
+                    if($rbest[0].Id -eq 'PROXY'){
+                      Write-Host ('    Channel re-selected: proxy ' + $rbest[0].Args[1] + ' (' + ('{0:N0}' -f $rbest[0].Speed) + ' B/s)') -ForegroundColor Green
+                    } else {
+                      Write-Host ('    Channel re-selected: direct IP ' + (($rbest[0].Args[1] -split ':')[-1]) + ' (' + ('{0:N0}' -f $rbest[0].Speed) + ' B/s)') -ForegroundColor Green
+                    }
                   } else {
-                    Write-Host ('    -> re-selected direct IP ' + (($rbest[0].Args[1] -split ':')[-1]) + ' (' + ('{0:N0}' -f $rbest[0].Speed) + ' B/s)') -ForegroundColor Green
+                    Write-Host ("`r" + (' ' * 110)) -NoNewline
+                    Write-Host ''
+                    Write-Host '    Channel re-selected: none available - continuing on the default route' -ForegroundColor Yellow
                   }
-                } else {
-                  Write-Host '    -> all channels failed, continuing on the default route' -ForegroundColor Yellow
                 }
               }
             }
@@ -897,8 +946,7 @@ while($queue.Count -gt 0 -or $active.Count -gt 0){
         $consecDlFail++
         if($consecDlFail -ge 3){
           # The active channel looks dead (proxy turned off, node dropped).
-          # Drop the pool + cache and continue on the plain default route.
-          Show-Info 'Channel appears down (3 consecutive failures) - switching to the default direct route ...' 'Yellow'
+          # Silently drop the pool + cache and continue on the default route.
           $ChannelPool = @()
           Remove-ChannelCache
           $consecDlFail = 0
@@ -906,7 +954,6 @@ while($queue.Count -gt 0 -or $active.Count -gt 0){
         if(Test-Path -LiteralPath $key){ Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue }
         if($a.Item.Tries -lt 3){
           $a.Item.Tries++
-          Show-Info ($a.Item.Name + ': download attempt ' + $a.Item.Tries + ' failed - waiting 10s before retry') 'Yellow'
           Start-Sleep -Seconds 10
           $queue.Enqueue($a.Item)
         } else {
