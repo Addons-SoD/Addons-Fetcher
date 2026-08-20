@@ -47,6 +47,7 @@ $Self      = $env:DEPLOY_SELF
 $ScriptDir = ($env:DEPLOY_DIR).TrimEnd('\')
 $DeployDir  = Join-Path $ScriptDir 'AddOns'
 $CacheFile = Join-Path $ScriptDir '.addons-fetcher-cache.json'
+$StateFile = Join-Path $ScriptDir '.addons-fetcher-state.json'
 $CacheTtl  = 1800
 
 # ----------------------------- configuration --------------------------------
@@ -378,6 +379,42 @@ function Write-ChannelCache($cdn){
 
 function Remove-ChannelCache{
   try{ if(Test-Path -LiteralPath $CacheFile){ Remove-Item -LiteralPath $CacheFile -Force -ErrorAction SilentlyContinue } }catch{}
+}
+
+# Incremental-update state: remembers which remote version each addon was
+# deployed with (CurseForge fileId / GitHub archive ETag). A later run
+# compares and skips everything that is already up to date. Deleting the
+# state file forces a full refresh.
+function Read-DeployState{
+  try{
+    if(Test-Path -LiteralPath $StateFile){
+      $j = Get-Content -LiteralPath $StateFile -Raw | ConvertFrom-Json
+      if($null -ne $j){ return $j }
+    }
+  }catch{}
+  return $null
+}
+
+function Write-DeployState($obj){
+  try{ $obj | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StateFile -Encoding UTF8 }catch{}
+}
+
+# HEAD a codeload archive URL and return its ETag (the commit identifier),
+# or $null when the check cannot run.
+function Get-CodeloadEtag($url,[string[]]$extraArgs){
+  try{
+    $hdrFile = Join-Path $Work ('etag_' + [Guid]::NewGuid().ToString('N').Substring(0,8) + '.txt')
+    $a = @('-s','-I','-L','-D',$hdrFile,'-o','NUL','--max-time','30')
+    if($extraArgs){ $a += $extraArgs }
+    $a += $url
+    & curl.exe @a 2>$null
+    if(Test-Path -LiteralPath $hdrFile){
+      $hdr = [IO.File]::ReadAllText($hdrFile)
+      $m = [regex]::Match($hdr, '(?im)^\s*etag:\s*"?([^"\r\n]+)"?')
+      if($m.Success){ return $m.Groups[1].Value }
+    }
+  }catch{}
+  return $null
 }
 
 # Pick the newest file for a project from a parsed /files JSON (page 1).
@@ -893,14 +930,30 @@ foreach($r in $resolved){
     $r.DlUrl = ([string]$r.DlUrl) + '?api-key=' + $CdnToken
   }
 }
+# Incremental update: skip CurseForge projects whose remote fileId matches
+# the last successfully deployed one (recorded in the state file).
+$deployState = Read-DeployState
+$cfSkip = 0
+foreach($r in $resolved){
+  $r.Skip = $false
+  if($deployState -and $deployState.cf -and ([string]$deployState.cf.($r.Name) -eq [string]$r.FileId)){
+    $r.Skip = $true
+    $cfSkip++
+  }
+}
+if($cfSkip -gt 0){
+  Write-Host ('  ' + $cfSkip + ' of ' + $resolved.Count + ' CurseForge addons already up to date (skipped).') -ForegroundColor Gray
+}
 $totalBytes = [long]0
-foreach($r in $resolved){ $totalBytes += $r.Len }
+foreach($r in $resolved){ if(-not $r.Skip){ $totalBytes += $r.Len } }
 if($totalBytes -le 0){ $totalBytes = [long]1 }
 
 $queue = New-Object System.Collections.Generic.Queue[object]
 $dlFailed  = New-Object System.Collections.Generic.List[string]
 foreach($r in $resolved){
-  if($r.DlUrl){ $queue.Enqueue($r) } else { $dlFailed.Add($r.Name + ' (no CDN link)') | Out-Null }
+  if($r.DlUrl){
+    if(-not $r.Skip){ $queue.Enqueue($r) }
+  } else { $dlFailed.Add($r.Name + ' (no CDN link)') | Out-Null }
 }
 $active    = @{}
 $doneBytes = [long]0
@@ -1178,6 +1231,16 @@ while($tarQueue.Count -gt 0 -or $tActive.Count -gt 0){
 }
 Finish-Line
 
+# Record which CurseForge fileIds were successfully deployed (skip entries
+# stay as they are; failed projects keep their old state so they retry).
+$cfState = @{}
+if($deployState -and $deployState.cf){
+  foreach($p in $deployState.cf.PSObject.Properties){ $cfState[$p.Name] = $p.Value }
+}
+foreach($r in $resolved){
+  if(-not $r.Skip -and ($extractOk -contains $r.Name)){ $cfState[$r.Name] = $r.FileId }
+}
+
 # ------------------------- phase 5: own SoD addons --------------------------
 # The *-SoD addons are ALWAYS downloaded from GitHub (source archive zip),
 # so the script works identically on any machine - no local git workspace
@@ -1189,6 +1252,8 @@ Write-Host ''
 Write-Host '[5/5] Downloading own SoD addons from GitHub ...' -ForegroundColor Green
 $sodOk   = New-Object System.Collections.Generic.List[string]
 $sodFail = New-Object System.Collections.Generic.List[string]
+$sodSkip = 0
+$sodEtag = @{}
 
 # GitHub channel: codeload.github.com is a different host than the CurseForge
 # CDN, so when a proxy is in use for CurseForge we compare proxy vs direct
@@ -1217,6 +1282,19 @@ foreach($s in $SodRepos){
   $i++
   # A single progress bar runs through the whole phase; the text is updated
   # in place as each repo is fetched (no per-repo lines).
+  # Incremental update: HEAD the codeload archive; when its ETag matches the
+  # last deployed commit, the repo is already up to date and is skipped.
+  $etag = Get-CodeloadEtag ('https://codeload.github.com/' + $GhUser + '/' + $s.Repo + '/zip/refs/heads/main') $GhArgs
+  $skip = $false
+  if($etag -and $deployState -and $deployState.sod -and ([string]$deployState.sod.($s.Folder) -eq [string]$etag)){
+    $skip = $true
+  }
+  if($skip){
+    $sodOk.Add($s.Folder) | Out-Null
+    $sodSkip++
+    Show-Bar ($i / $SodRepos.Count) ('up to date: ' + $s.Folder + ' (' + $i + '/' + $SodRepos.Count + ')')
+    continue
+  }
   Show-Bar (($i - 1) / $SodRepos.Count) ('downloading ' + $s.Folder + ' (' + $i + '/' + $SodRepos.Count + ')')
   $target = Join-Path $DeployDir $s.Folder
   $done   = $false
@@ -1270,6 +1348,7 @@ foreach($s in $SodRepos){
   }
   if($done){
     $sodOk.Add($s.Folder) | Out-Null
+    $sodEtag[$s.Folder] = $etag
     Show-Bar ($i / $SodRepos.Count) ('OK: ' + $s.Folder + ' ' + $dlInfo + ' (' + $i + '/' + $SodRepos.Count + ')')
   } else {
     $sodFail.Add($s.Folder) | Out-Null
@@ -1277,6 +1356,17 @@ foreach($s in $SodRepos){
   }
 }
 Finish-Line
+if($sodSkip -gt 0){
+  Write-Host ('  ' + $sodSkip + ' of ' + $SodRepos.Count + ' SoD addons already up to date (skipped).') -ForegroundColor Gray
+}
+
+# Persist the incremental-update state (cf already merged above; sod now).
+$sodState = @{}
+if($deployState -and $deployState.sod){
+  foreach($p in $deployState.sod.PSObject.Properties){ $sodState[$p.Name] = $p.Value }
+}
+foreach($k in $sodEtag.Keys){ $sodState[$k] = $sodEtag[$k] }
+Write-DeployState @{ cf = $cfState; sod = $sodState }
 
 # ------------------------------- cleanup ------------------------------------
 Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
@@ -1286,7 +1376,7 @@ Write-Host ''
 Write-Host $HLine -ForegroundColor Cyan
 Write-Host '  Deployment summary' -ForegroundColor Cyan
 Write-Host $HLine -ForegroundColor Cyan
-Write-Host ('  CurseForge OK   : ' + $extractOk.Count + '/' + $Projects.Count) -ForegroundColor Green
+Write-Host ('  CurseForge OK   : ' + ($extractOk.Count + $cfSkip) + '/' + $Projects.Count) -ForegroundColor Green
 if($extractFail.Count -gt 0){
   Write-Host (Truncate-Text ('  Extract FAILED  : ' + ($extractFail -join '; ')) $ConWidth) -ForegroundColor Red
 }
@@ -1301,6 +1391,7 @@ if($sodFail.Count -gt 0){
   Write-Host (Truncate-Text ('  SoD FAILED      : ' + ($sodFail -join ', ')) $ConWidth) -ForegroundColor Red
 }
 Write-Host '  Downloaded zip files have been removed.' -ForegroundColor Gray
+Write-Host ('  Tip: delete ' + $StateFile + ' to force a full refresh.') -ForegroundColor Gray
 Write-Host ''
 Restore-ConsoleMode
 Read-Host '  Press Enter to exit' | Out-Null
