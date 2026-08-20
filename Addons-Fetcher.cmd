@@ -119,6 +119,7 @@ $SodRepos = @(
   @{ Repo = 'BFGadgets-SoD';        Folder = 'BFGadgets'       },
   @{ Repo = 'BiaoGe-SoD';           Folder = 'BiaoGe'          },
   @{ Repo = 'bloodOfHeros-SoD';     Folder = 'bloodOfHeros'    },
+  @{ Repo = 'MYStats-SoD';          Folder = 'MYStats'         },
   @{ Repo = 'RepairHelper-SoD';     Folder = 'RepairHelper'    },
   @{ Repo = 'SellerHelper-SoD';     Folder = 'SellerHelper'    },
   @{ Repo = 'TheBurningTrade-SoD';  Folder = 'TheBurningTrade' },
