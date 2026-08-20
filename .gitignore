@@ -1,3 +1,7 @@
 # Deployed addons (the script extracts everything into ./Addons)
 Addons/
 AddOns/
+
+
+# Runtime incremental-update state.
+.addons-fetcher-state.json
