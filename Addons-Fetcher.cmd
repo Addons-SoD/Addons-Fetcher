@@ -87,6 +87,7 @@ $Projects = @(
   @{ Name = 'DruidBarClassic';          Id = 334762  },
   @{ Name = 'ExtendedCharacterStats';   Id = 334877  },
   @{ Name = 'GatherMate2';              Id = 405809  },
+  @{ Name = 'idTip';                    Id = 24541   },
   @{ Name = 'Leatrix_Maps';             Id = 298842  },
   @{ Name = 'LiteButtonAuras';          Id = 526431  },
   @{ Name = 'MessageQueue';             Id = 358350  },
