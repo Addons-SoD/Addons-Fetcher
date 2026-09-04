@@ -555,11 +555,12 @@ function Invoke-CurlDownload($url,$outFile,$timeoutSec,[string[]]$extraArgs){
 # ----------------------- integrity & planning helpers (v4) -------------------
 # Symbols used by the plan list. ASCII only, so they render on any console
 # (double-clicking the .cmd runs in a raster/legacy-code-page window where
-# non-ASCII glyphs like the check/cross characters would not display). Color
-# carries the meaning too: green + / yellow ! / red x.
-$SymOk  = '+'      # up to date (md5 ok)
-$SymBad = '!'      # damaged - will re-download
-$SymDel = 'x'      # no longer in list - will delete
+# non-ASCII glyphs would not display). Color carries the meaning too.
+$SymOk   = '+'      # up to date (md5 ok)
+$SymBad  = '!'      # damaged - will re-download
+$SymDl   = '*'      # will download (new or update)
+$SymDel  = '-'      # no longer in list - will delete
+$SymFail = 'x'      # resolve failed - left as is
 
 # Normalise a stored CurseForge entry. Legacy entries were plain strings
 # (fileId only) -> no md5/folders, so they must be re-downloaded once.
@@ -964,35 +965,48 @@ foreach($v in $toVerify){
 $dropCf  = @{}   # state keys to remove at persist time
 $dropSod = @{}
 Write-Host ''
-Write-Host '  Plan: (no mark = will download, + = up to date, ! = damaged, x = delete)' -ForegroundColor Gray
-function Add-PlanLine($sym,$color,$text){
-  $pad = ' '
-  if($sym){ $pad = $sym + ' ' }
-  Write-Host (Truncate-Text ('    ' + $pad + $text) $ConWidth) -ForegroundColor $color
+Write-Host '  Plan: (* will download, + up to date, ! damaged, x resolve failed, - delete)' -ForegroundColor Gray
+# Shorten a long file name in the middle so the plan row stays on one line.
+function Shorten-Mid([string]$s,[int]$max){
+  if($s.Length -le $max){ return $s }
+  return $s.Substring(0, [Math]::Max(8, $max - 14)) + '...' + $s.Substring($s.Length - 11)
+}
+function Add-PlanLine($sym,$color,$name,$state,$file){
+  $p = ' '
+  if($sym){ $p = $sym + ' ' }
+  $line = '    ' + $p + $name.PadRight(21)
+  if($file){ $line += '(' + (Shorten-Mid $file 30) + ') ' }
+  $line += $state
+  Write-Host (Truncate-Text $line $ConWidth) -ForegroundColor $color
 }
 foreach($r in $resolved){
   if($r.Plan -eq 'skip'){
-    Add-PlanLine $SymOk 'Green' ($r.Name.PadRight(26) + 'up to date (md5 ok)')
+    Add-PlanLine $SymOk 'Green' $r.Name 'up to date (md5 ok)' ([string]$r.ZipName)
   } elseif($r.Damaged){
-    Add-PlanLine $SymBad 'Yellow' ($r.Name.PadRight(26) + 'damaged - will re-download')
+    Add-PlanLine $SymBad 'Yellow' $r.Name 'damaged - re-download' ([string]$r.ZipName)
   } else {
-    Add-PlanLine '' 'Gray' ($r.Name.PadRight(26) + 'will download')
+    Add-PlanLine $SymDl 'Gray' $r.Name 'will download' ([string]$r.ZipName)
   }
 }
-foreach($d in $cfDelete){ Add-PlanLine $SymDel 'Red' ($d.Key.PadRight(26) + 'no longer in list - will delete'); $dropCf[$d.Key] = $true }
+foreach($d in $cfDelete){ Add-PlanLine $SymDel 'Red' $d.Key 'no longer in list' ''; $dropCf[$d.Key] = $true }
 foreach($s in $SodRepos){
+  # GitHub side has no zip name: show the codeload commit hash (first 7 chars).
+  $gh = ''
+  $et = $sodRemote[$s.Folder]
+  if(-not $et){ $et = $sodEtagPlan[$s.Folder] }
+  if($et){ $gh = $et.Substring(0, [Math]::Min(7, $et.Length)) }
   if($sodSkipOk.ContainsKey($s.Folder)){
-    Add-PlanLine $SymOk 'Green' ($s.Folder.PadRight(26) + 'up to date (md5 ok)')
+    Add-PlanLine $SymOk 'Green' $s.Folder 'up to date (md5 ok)' $gh
   } elseif($damaged.Key -contains $s.Folder){
-    Add-PlanLine $SymBad 'Yellow' ($s.Folder.PadRight(26) + 'damaged - will re-download')
+    Add-PlanLine $SymBad 'Yellow' $s.Folder 'damaged - re-download' $gh
   } else {
-    Add-PlanLine '' 'Gray' ($s.Folder.PadRight(26) + 'will download')
+    Add-PlanLine $SymDl 'Gray' $s.Folder 'will download' $gh
   }
 }
-foreach($d in $sodDelete){ Add-PlanLine $SymDel 'Red' ($d.Key.PadRight(26) + 'no longer in list - will delete'); $dropSod[$d.Key] = $true }
+foreach($d in $sodDelete){ Add-PlanLine $SymDel 'Red' $d.Key 'no longer in list' ''; $dropSod[$d.Key] = $true }
 # Entries that could not even be resolved keep their current state untouched.
 foreach($f in $resolveFail){
-  Add-PlanLine $SymBad 'Red' ($f.PadRight(26) + 'resolve failed - left as is')
+  Add-PlanLine $SymFail 'Red' $f 'resolve failed' ''
 }
 
 # ---- execute deletes (before any download, per requirement) -----------------
