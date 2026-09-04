@@ -556,11 +556,11 @@ function Invoke-CurlDownload($url,$outFile,$timeoutSec,[string[]]$extraArgs){
 # Symbols used by the plan list. ASCII only, so they render on any console
 # (double-clicking the .cmd runs in a raster/legacy-code-page window where
 # non-ASCII glyphs would not display). Color carries the meaning too.
-$SymOk   = '+'      # up to date (md5 ok)
-$SymBad  = '!'      # damaged - will re-download
-$SymDl   = '*'      # will download (new or update)
-$SymDel  = '-'      # no longer in list - will delete
-$SymFail = 'x'      # resolve failed - left as is
+$SymOk   = '*'      # up to date (md5 ok) - green
+$SymBad  = '!'      # damaged - will re-download - yellow
+$SymDl   = '+'      # will download (new or update) - blue
+$SymDel  = '-'      # no longer in list - will delete - red
+$SymFail = 'x'      # resolve failed - left as is - red
 
 # Normalise a stored CurseForge entry. Legacy entries were plain strings
 # (fileId only) -> no md5/folders, so they must be re-downloaded once.
@@ -965,7 +965,7 @@ foreach($v in $toVerify){
 $dropCf  = @{}   # state keys to remove at persist time
 $dropSod = @{}
 Write-Host ''
-Write-Host '  Plan: (* will download, + up to date, ! damaged, x resolve failed, - delete)' -ForegroundColor Gray
+Write-Host '  Plan: (* up to date, + will download, ! damaged, x resolve failed, - delete)' -ForegroundColor Gray
 # Shorten a long file name in the middle so the plan row stays on one line.
 function Shorten-Mid([string]$s,[int]$max){
   if($s.Length -le $max){ return $s }
@@ -985,7 +985,7 @@ foreach($r in $resolved){
   } elseif($r.Damaged){
     Add-PlanLine $SymBad 'Yellow' $r.Name 'damaged - re-download' ([string]$r.ZipName)
   } else {
-    Add-PlanLine $SymDl 'Gray' $r.Name 'will download' ([string]$r.ZipName)
+    Add-PlanLine $SymDl 'Blue' $r.Name 'will download' ([string]$r.ZipName)
   }
 }
 foreach($d in $cfDelete){ Add-PlanLine $SymDel 'Red' $d.Key 'no longer in list' ''; $dropCf[$d.Key] = $true }
@@ -1000,7 +1000,7 @@ foreach($s in $SodRepos){
   } elseif($damaged.Key -contains $s.Folder){
     Add-PlanLine $SymBad 'Yellow' $s.Folder 'damaged - re-download' $gh
   } else {
-    Add-PlanLine $SymDl 'Gray' $s.Folder 'will download' $gh
+    Add-PlanLine $SymDl 'Blue' $s.Folder 'will download' $gh
   }
 }
 foreach($d in $sodDelete){ Add-PlanLine $SymDel 'Red' $d.Key 'no longer in list' ''; $dropSod[$d.Key] = $true }
