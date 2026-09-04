@@ -57,7 +57,9 @@ $ApiBase     = 'https://www.curseforge.com/api/v1'
 $CoreBase    = 'https://api.curseforge.com/v1'
 $CfApiKey    = '$2a$10$bL4bIL5pUWqfcO7KQtnMReakwtfHbNKh6v1uTpKlzhwoueEJQnPnm'
 $GhUser      = 'Addons-SoD'
-$Concurrency = 8
+# Parallel curl workers for CurseForge resolves and downloads: logical
+# cores - 2 (min 1), the same rule extraction uses below.
+$Concurrency = [Math]::Max(1, [Environment]::ProcessorCount - 2)
 $SilenceSec   = 180
 $CdnSilenceSec = 60
 $CdnToken    = '267C6CA3'
@@ -593,7 +595,7 @@ New-Item -ItemType Directory -Force -Path $DlDir | Out-Null
 
 # --------------------- phase 1: resolve latest files (parallel) -------------
 Write-Host ''
-Write-Host '[1/5] Resolving latest Classic Era files on CurseForge (parallel) ...' -ForegroundColor Green
+Write-Host ('[1/5] Resolving latest Classic Era files on CurseForge (parallel x' + $Concurrency + ') ...') -ForegroundColor Green
 $resolved     = New-Object System.Collections.Generic.List[object]
 $resolveFail  = New-Object System.Collections.Generic.List[string]
 $coreFail     = New-Object System.Collections.Generic.List[object]
