@@ -553,10 +553,13 @@ function Invoke-CurlDownload($url,$outFile,$timeoutSec,[string[]]$extraArgs){
 }
 
 # ----------------------- integrity & planning helpers (v4) -------------------
-# Symbols used by the plan list (built from code points, file stays ASCII).
-$SymOk  = [string][char]0x2713          # green check - up to date
-$SymBad = [string][char]0x21            # '!'         - damaged, will re-download
-$SymDel = [string][char]0x2717          # red cross   - to be deleted
+# Symbols used by the plan list. ASCII only, so they render on any console
+# (double-clicking the .cmd runs in a raster/legacy-code-page window where
+# non-ASCII glyphs like the check/cross characters would not display). Color
+# carries the meaning too: green + / yellow ! / red x.
+$SymOk  = '+'      # up to date (md5 ok)
+$SymBad = '!'      # damaged - will re-download
+$SymDel = 'x'      # no longer in list - will delete
 
 # Normalise a stored CurseForge entry. Legacy entries were plain strings
 # (fileId only) -> no md5/folders, so they must be re-downloaded once.
@@ -848,14 +851,6 @@ if($coreFail.Count -gt 0){
   }
 }
 
-Write-Host ('  Resolved ' + $resolved.Count + '/' + $Projects.Count + ' projects:') -ForegroundColor Gray
-foreach($r in $resolved){
-  Write-Host (Truncate-Text ('    - ' + $r.Name.PadRight(24) + $r.ZipName) $ConWidth) -ForegroundColor Gray
-}
-if($resolveFail.Count -gt 0){
-  Write-Host (Truncate-Text ('  FAILED to resolve: ' + ($resolveFail -join ', ')) $ConWidth) -ForegroundColor Red
-}
-
 # ============= integrity planning (v4): classify, verify, clean ==============
 # Three outcomes after resolve:
 #   download  - not deployed yet / remote version moved / state has no md5
@@ -969,7 +964,7 @@ foreach($v in $toVerify){
 $dropCf  = @{}   # state keys to remove at persist time
 $dropSod = @{}
 Write-Host ''
-Write-Host '  Plan:' -ForegroundColor Gray
+Write-Host '  Plan: (no mark = will download, + = up to date, ! = damaged, x = delete)' -ForegroundColor Gray
 function Add-PlanLine($sym,$color,$text){
   $pad = ' '
   if($sym){ $pad = $sym + ' ' }
@@ -995,6 +990,10 @@ foreach($s in $SodRepos){
   }
 }
 foreach($d in $sodDelete){ Add-PlanLine $SymDel 'Red' ($d.Key.PadRight(26) + 'no longer in list - will delete'); $dropSod[$d.Key] = $true }
+# Entries that could not even be resolved keep their current state untouched.
+foreach($f in $resolveFail){
+  Add-PlanLine $SymBad 'Red' ($f.PadRight(26) + 'resolve failed - left as is')
+}
 
 # ---- execute deletes (before any download, per requirement) -----------------
 $toDel = New-Object System.Collections.Generic.List[object]
