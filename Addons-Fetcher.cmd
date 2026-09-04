@@ -552,6 +552,105 @@ function Invoke-CurlDownload($url,$outFile,$timeoutSec,[string[]]$extraArgs){
   return ($LASTEXITCODE -eq 0)
 }
 
+# ----------------------- integrity & planning helpers (v4) -------------------
+# Symbols used by the plan list (built from code points, file stays ASCII).
+$SymOk  = [string][char]0x2713          # green check - up to date
+$SymBad = [string][char]0x21            # '!'         - damaged, will re-download
+$SymDel = [string][char]0x2717          # red cross   - to be deleted
+
+# Normalise a stored CurseForge entry. Legacy entries were plain strings
+# (fileId only) -> no md5/folders, so they must be re-downloaded once.
+function Read-CfStateEntry($raw){
+  if($null -eq $raw){ return @{ FileId=''; Md5=''; Folders=@() } }
+  if($raw -is [string]){ return @{ FileId=[string]$raw; Md5=''; Folders=@() } }
+  return @{
+    FileId  = [string]$raw.fileId
+    Md5     = [string]$raw.md5
+    Folders = @(@($raw.folders) | Where-Object { $_ })
+  }
+}
+
+# Same for a stored SoD entry (keyed by the addon folder name; legacy = etag string).
+function Read-SodStateEntry($raw){
+  if($null -eq $raw){ return @{ Etag=''; Md5=''; Folders=@() } }
+  if($raw -is [string]){ return @{ Etag=[string]$raw; Md5=''; Folders=@() } }
+  return @{
+    Etag    = [string]$raw.etag
+    Md5     = [string]$raw.md5
+    Folders = @(@($raw.folders) | Where-Object { $_ })
+  }
+}
+
+# Aggregate MD5 of one managed addon: every file under its recorded folders
+# (relative paths included) is hashed; the concatenation is hashed again.
+# Returns '' when no file could be read (missing/empty folders).
+$Md5WorkerScript = {
+  param($deploy,$folders)
+  $h = [System.Security.Cryptography.MD5]::Create()
+  $sb = New-Object System.Text.StringBuilder
+  $list = New-Object System.Collections.Generic.List[string]
+  try{
+    foreach($fd in $folders){
+      $d = Join-Path $deploy $fd
+      if(Test-Path -LiteralPath $d){
+        @(Get-ChildItem -LiteralPath $d -Recurse -File -ErrorAction SilentlyContinue) | ForEach-Object { $list.Add($_.FullName) }
+      }
+    }
+    $sorted = @($list | Sort-Object)
+    if($sorted.Count -eq 0){ return '' }
+    foreach($p in $sorted){
+      $rel = $p.Substring($deploy.Length).TrimStart('\')
+      $fs = [IO.File]::OpenRead($p)
+      try{ $fh = $h.ComputeHash($fs) } finally { $fs.Close() }
+      [void]$sb.Append($rel).Append('|').Append([BitConverter]::ToString($fh).Replace('-','')).Append(';')
+    }
+    $final = $h.ComputeHash([Text.Encoding]::UTF8.GetBytes($sb.ToString()))
+    return [BitConverter]::ToString($final).Replace('-','')
+  }catch{
+    return ''
+  }finally{
+    $h.Dispose()
+  }
+}
+
+# Compute the aggregate md5 of a list of entries in parallel (cores - 2 runspaces).
+# $items: @{ Key; Folders }. Returns a hashtable Key -> md5 ('' on failure).
+function Invoke-Md5Parallel($items){
+  $result = @{}
+  if($items.Count -eq 0){ return $result }
+  $workers = [Math]::Max(1, [Environment]::ProcessorCount - 2)
+  $pool = [runspacefactory]::CreateRunspacePool(1, $workers)
+  $pool.Open()
+  $jobs = New-Object System.Collections.Generic.List[object]
+  foreach($it in $items){
+    $ps = [powershell]::Create()
+    $ps.RunspacePool = $pool
+    [void]$ps.AddScript($Md5WorkerScript).AddArgument($DeployDir).AddArgument([string[]]@($it.Folders))
+    $jobs.Add(@{ Key=$it.Key; PS=$ps; Async=$ps.BeginInvoke() }) | Out-Null
+  }
+  while($jobs.Count -gt 0){
+    $doneArr = @($jobs | Where-Object { $_.Async.IsCompleted })
+    foreach($j in $doneArr){
+      try{ $result[$j.Key] = [string]$j.PS.EndInvoke($j.Async) }catch{ $result[$j.Key] = '' }
+      $j.PS.Dispose()
+      $jobs.Remove($j) | Out-Null
+    }
+    if($jobs.Count -gt 0){ Start-Sleep -Milliseconds 150 }
+  }
+  $pool.Close(); $pool.Dispose()
+  return $result
+}
+
+# Delete the recorded folders of one managed entry from the deploy directory.
+function Remove-EntryFolders($folders){
+  foreach($fd in $folders){
+    $d = Join-Path $DeployDir $fd
+    if($fd -and (Test-Path -LiteralPath $d)){
+      Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
 # ------------------------------ pre-checks ----------------------------------
 Init-ConsoleMode
 Write-Host ''
@@ -757,6 +856,161 @@ if($resolveFail.Count -gt 0){
   Write-Host (Truncate-Text ('  FAILED to resolve: ' + ($resolveFail -join ', ')) $ConWidth) -ForegroundColor Red
 }
 
+# ============= integrity planning (v4): classify, verify, clean ==============
+# Three outcomes after resolve:
+#   download  - not deployed yet / remote version moved / state has no md5
+#               (legacy state entries are re-downloaded once, md5 rebuilt)
+#   verify    - remote version matches state: check local md5 (cores - 2 threads)
+#   delete    - entry tracked in state but no longer in the download lists
+Write-Host ''
+Write-Host ('  Classifying ' + ($Projects.Count + $SodRepos.Count) + ' managed addons ...') -ForegroundColor Green
+$deployState = Read-DeployState
+
+# Remote SoD versions (codeload ETag) are resolved up front so the same
+# download/verify/delete decision can be made for GitHub-sourced addons.
+$sodRemote = @{}
+if($SodRepos.Count -gt 0){
+  $si = 0
+  foreach($s in $SodRepos){
+    $si++
+    Show-Bar ($si / $SodRepos.Count) ('HEAD codeload ' + $s.Folder + ' (' + $si + '/' + $SodRepos.Count + ')')
+    $sodRemote[$s.Folder] = Get-CodeloadEtag ('https://codeload.github.com/' + $GhUser + '/' + $s.Repo + '/zip/refs/heads/main') @()
+  }
+  Finish-Line
+}
+
+$currentCf  = @{}; foreach($p in $Projects){ $currentCf[$p.Name] = $true }
+$currentSod = @{}; foreach($s in $SodRepos){ $currentSod[$s.Folder] = $true }
+
+$toVerify     = New-Object System.Collections.Generic.List[object] # @{Kind;Key;Folders;Md5;Ref}
+$toDownloadCf = New-Object System.Collections.Generic.List[object]
+$cfDelete     = New-Object System.Collections.Generic.List[object] # @{Kind;Key;Folders}
+$sodDelete    = New-Object System.Collections.Generic.List[object]
+$sodDl        = @{}   # SoD folders that must be (re)downloaded
+$sodEtagPlan  = @{}   # SoD folder -> remote etag to record after a fresh deploy
+$cfSkipOk     = @{}   # CF names verified intact (green check)
+$sodSkipOk    = @{}   # SoD folders verified intact
+
+# ---- CurseForge entries (order of $resolved) -------------------------------
+foreach($r in $resolved){
+  $raw = $null
+  if($deployState -and $deployState.cf){ $raw = $deployState.cf.($r.Name) }
+  $e = Read-CfStateEntry $raw
+  if($e.FileId -ne '' -and $e.FileId -eq ([string]$r.FileId) -and $e.Md5){
+    $r.Plan = 'verify'
+    $toVerify.Add(@{ Kind='cf'; Key=$r.Name; Folders=$e.Folders; Md5=$e.Md5; Ref=$r }) | Out-Null
+  } else {
+    $r.Plan = 'download'
+    $toDownloadCf.Add($r) | Out-Null
+  }
+}
+# CF entries tracked in state whose project left the list.
+if($deployState -and $deployState.cf){
+  foreach($p in $deployState.cf.PSObject.Properties){
+    if(-not $currentCf.ContainsKey($p.Name)){
+      $e = Read-CfStateEntry $p.Value
+      $cfDelete.Add(@{ Kind='cf'; Key=$p.Name; Folders=$e.Folders }) | Out-Null
+    }
+  }
+}
+
+# ---- SoD entries ------------------------------------------------------------
+foreach($s in $SodRepos){
+  $raw = $null
+  if($deployState -and $deployState.sod){ $raw = $deployState.sod.($s.Folder) }
+  $e = Read-SodStateEntry $raw
+  $etag = $sodRemote[$s.Folder]
+  $sodEtagPlan[$s.Folder] = $etag
+  if($etag -and $e.Etag -eq $etag -and $e.Md5){
+    $toVerify.Add(@{ Kind='sod'; Key=$s.Folder; Folders=$e.Folders; Md5=$e.Md5; Folder=$s.Folder }) | Out-Null
+  } else {
+    $sodDl[$s.Folder] = $true
+  }
+}
+if($deployState -and $deployState.sod){
+  foreach($p in $deployState.sod.PSObject.Properties){
+    if(-not $currentSod.ContainsKey($p.Name)){
+      $e = Read-SodStateEntry $p.Value
+      $sodDelete.Add(@{ Kind='sod'; Key=$p.Name; Folders=$e.Folders }) | Out-Null
+    }
+  }
+}
+
+# ---- integrity check of the verify set (parallel md5, cores - 2) ------------
+$md5Res = @{}
+if($toVerify.Count -gt 0){
+  Write-Host ('  Verifying ' + $toVerify.Count + ' up-to-date addons (md5, x' + [Math]::Max(1, [Environment]::ProcessorCount - 2) + ' threads) ...') -ForegroundColor Green
+  $md5Res = Invoke-Md5Parallel $toVerify
+}
+$damaged = New-Object System.Collections.Generic.List[object]  # @{Kind;Key;Folders}
+foreach($v in $toVerify){
+  $cur = ''
+  if($md5Res.ContainsKey($v.Key)){ $cur = $md5Res[$v.Key] }
+  if($cur -ne '' -and $cur -eq $v.Md5){
+    if($v.Kind -eq 'cf'){
+      $v.Ref.Plan = 'skip'
+      $cfSkipOk[$v.Key] = $true
+    } else {
+      $sodSkipOk[$v.Key] = $true
+    }
+  } else {
+    $damaged.Add(@{ Kind=$v.Kind; Key=$v.Key; Folders=$v.Folders }) | Out-Null
+    if($v.Kind -eq 'cf'){
+      $v.Ref.Plan = 'download'
+      $v.Ref.Damaged = $true
+      $toDownloadCf.Add($v.Ref) | Out-Null
+    } else {
+      $sodDl[$v.Key] = $true
+    }
+  }
+}
+
+# ---- plan list ---------------------------------------------------------------
+$dropCf  = @{}   # state keys to remove at persist time
+$dropSod = @{}
+Write-Host ''
+Write-Host '  Plan:' -ForegroundColor Gray
+function Add-PlanLine($sym,$color,$text){
+  $pad = ' '
+  if($sym){ $pad = $sym + ' ' }
+  Write-Host (Truncate-Text ('    ' + $pad + $text) $ConWidth) -ForegroundColor $color
+}
+foreach($r in $resolved){
+  if($r.Plan -eq 'skip'){
+    Add-PlanLine $SymOk 'Green' ($r.Name.PadRight(26) + 'up to date (md5 ok)')
+  } elseif($r.Damaged){
+    Add-PlanLine $SymBad 'Yellow' ($r.Name.PadRight(26) + 'damaged - will re-download')
+  } else {
+    Add-PlanLine '' 'Gray' ($r.Name.PadRight(26) + 'will download')
+  }
+}
+foreach($d in $cfDelete){ Add-PlanLine $SymDel 'Red' ($d.Key.PadRight(26) + 'no longer in list - will delete'); $dropCf[$d.Key] = $true }
+foreach($s in $SodRepos){
+  if($sodSkipOk.ContainsKey($s.Folder)){
+    Add-PlanLine $SymOk 'Green' ($s.Folder.PadRight(26) + 'up to date (md5 ok)')
+  } elseif($damaged.Key -contains $s.Folder){
+    Add-PlanLine $SymBad 'Yellow' ($s.Folder.PadRight(26) + 'damaged - will re-download')
+  } else {
+    Add-PlanLine '' 'Gray' ($s.Folder.PadRight(26) + 'will download')
+  }
+}
+foreach($d in $sodDelete){ Add-PlanLine $SymDel 'Red' ($d.Key.PadRight(26) + 'no longer in list - will delete'); $dropSod[$d.Key] = $true }
+
+# ---- execute deletes (before any download, per requirement) -----------------
+$toDel = New-Object System.Collections.Generic.List[object]
+foreach($d in $cfDelete){ $toDel.Add($d) | Out-Null }
+foreach($d in $sodDelete){ $toDel.Add($d) | Out-Null }
+foreach($d in $damaged){  $toDel.Add($d) | Out-Null }
+if($toDel.Count -gt 0){
+  Write-Host ('  Deleting ' + $toDel.Count + ' stale/damaged addon folder(s) ...') -ForegroundColor Gray
+  foreach($d in $toDel){
+    $folders = @($d.Folders)
+    if($folders.Count -eq 0){ $folders = @($d.Key) }   # legacy entry: best effort by name
+    Remove-EntryFolders $folders
+  }
+  Write-Host '  Deleted.' -ForegroundColor Gray
+}
+
 # ------------------ phase 2: select fastest download channel ---------------
 Write-Host ''
 Write-Host '[2/5] Selecting fastest download channel ...' -ForegroundColor Green
@@ -932,29 +1186,22 @@ foreach($r in $resolved){
     $r.DlUrl = ([string]$r.DlUrl) + '?api-key=' + $CdnToken
   }
 }
-# Incremental update: skip CurseForge projects whose remote fileId matches
-# the last successfully deployed one (recorded in the state file).
-$deployState = Read-DeployState
-$cfSkip = 0
-foreach($r in $resolved){
-  $r.Skip = $false
-  if($deployState -and $deployState.cf -and ([string]$deployState.cf.($r.Name) -eq [string]$r.FileId)){
-    $r.Skip = $true
-    $cfSkip++
-  }
-}
+# Download set = entries the integrity plan marked 'download' (new / updated /
+# damaged). 'skip' entries were md5-verified intact above.
+$cfSkip = $cfSkipOk.Count
 if($cfSkip -gt 0){
-  Write-Host ('  ' + $cfSkip + ' of ' + $resolved.Count + ' CurseForge addons already up to date (skipped).') -ForegroundColor Gray
+  Write-Host ('  ' + $cfSkip + ' of ' + $resolved.Count + ' CurseForge addons verified up to date (md5 ok, skipped).') -ForegroundColor Gray
 }
 $totalBytes = [long]0
-foreach($r in $resolved){ if(-not $r.Skip){ $totalBytes += $r.Len } }
+foreach($r in $resolved){ if($r.Plan -eq 'download'){ $totalBytes += $r.Len } }
 if($totalBytes -le 0){ $totalBytes = [long]1 }
 
 $queue = New-Object System.Collections.Generic.Queue[object]
 $dlFailed  = New-Object System.Collections.Generic.List[string]
 foreach($r in $resolved){
+  if($r.Plan -ne 'download'){ continue }
   if($r.DlUrl){
-    if(-not $r.Skip){ $queue.Enqueue($r) }
+    $queue.Enqueue($r)
   } else { $dlFailed.Add($r.Name + ' (no CDN link)') | Out-Null }
 }
 $active    = @{}
@@ -1167,11 +1414,14 @@ function Complete-Extract($r,$stage){
   try{
     $tops = @(Get-ChildItem -LiteralPath $stage -Directory -ErrorAction Stop)
     if($tops.Count -eq 0){ throw 'zip contains no addon folder' }
+    $moved = @()
     foreach($d in $tops){
       $target = Join-Path $DeployDir $d.Name
       if(Test-Path -LiteralPath $target){ Remove-Item -LiteralPath $target -Recurse -Force }
       Move-Item -LiteralPath $d.FullName -Destination $target -Force
+      $moved += $d.Name
     }
+    $r.Folders = @($moved)
     $extractOk.Add($r.Name) | Out-Null
   }catch{
     $extractFail.Add($r.Name + ' (' + $_.Exception.Message + ')') | Out-Null
@@ -1233,14 +1483,26 @@ while($tarQueue.Count -gt 0 -or $tActive.Count -gt 0){
 }
 Finish-Line
 
-# Record which CurseForge fileIds were successfully deployed (skip entries
-# stay as they are; failed projects keep their old state so they retry).
+# Record CurseForge state for the next run: freshly deployed entries get
+# {fileId, md5, folders}; verified-skip entries keep their stored object;
+# deleted keys (no longer in the list) and damaged-then-redeployed keys are
+# replaced/dropped here. Failed downloads keep their old state so they retry.
 $cfState = @{}
 if($deployState -and $deployState.cf){
-  foreach($p in $deployState.cf.PSObject.Properties){ $cfState[$p.Name] = $p.Value }
+  foreach($p in $deployState.cf.PSObject.Properties){
+    if(-not $dropCf.ContainsKey($p.Name)){ $cfState[$p.Name] = $p.Value }
+  }
 }
-foreach($r in $resolved){
-  if(-not $r.Skip -and ($extractOk -contains $r.Name)){ $cfState[$r.Name] = $r.FileId }
+$freshCf = @($resolved | Where-Object { $_.Plan -eq 'download' -and ($extractOk -contains $_.Name) -and $_.Folders })
+$cfMd5 = @{}
+if($freshCf.Count -gt 0){
+  Write-Host ('  Computing md5 for ' + $freshCf.Count + ' newly deployed CurseForge addon(s) ...') -ForegroundColor Gray
+  $cfMd5 = Invoke-Md5Parallel (@($freshCf | ForEach-Object { @{ Key=$_.Name; Folders=@($_.Folders) } }))
+}
+foreach($r in $freshCf){
+  $md5 = ''
+  if($cfMd5.ContainsKey($r.Name)){ $md5 = $cfMd5[$r.Name] }
+  $cfState[$r.Name] = @{ fileId = [string]$r.FileId; md5 = $md5; folders = @($r.Folders) }
 }
 
 # ------------------------- phase 5: own SoD addons --------------------------
@@ -1282,16 +1544,8 @@ if($ChProxy -and $SodRepos.Count -gt 0){
 $i = 0
 foreach($s in $SodRepos){
   $i++
-  # A single progress bar runs through the whole phase; the text is updated
-  # in place as each repo is fetched (no per-repo lines).
-  # Incremental update: HEAD the codeload archive; when its ETag matches the
-  # last deployed commit, the repo is already up to date and is skipped.
-  $etag = Get-CodeloadEtag ('https://codeload.github.com/' + $GhUser + '/' + $s.Repo + '/zip/refs/heads/main') $GhArgs
-  $skip = $false
-  if($etag -and $deployState -and $deployState.sod -and ([string]$deployState.sod.($s.Folder) -eq [string]$etag)){
-    $skip = $true
-  }
-  if($skip){
+  # Verified-intact repos (md5 ok in the integrity phase) are not downloaded.
+  if($sodSkipOk.ContainsKey($s.Folder)){
     $sodOk.Add($s.Folder) | Out-Null
     $sodSkip++
     Show-Bar ($i / $SodRepos.Count) ('up to date: ' + $s.Folder + ' (' + $i + '/' + $SodRepos.Count + ')')
@@ -1350,7 +1604,11 @@ foreach($s in $SodRepos){
   }
   if($done){
     $sodOk.Add($s.Folder) | Out-Null
-    $sodEtag[$s.Folder] = $etag
+    $sodEtag[$s.Folder] = $sodEtagPlan[$s.Folder]
+    if(-not $sodEtag[$s.Folder]){
+      # HEAD failed during planning; fetch it now so the state has an etag.
+      $sodEtag[$s.Folder] = Get-CodeloadEtag ('https://codeload.github.com/' + $GhUser + '/' + $s.Repo + '/zip/refs/heads/main') $GhArgs
+    }
     Show-Bar ($i / $SodRepos.Count) ('OK: ' + $s.Folder + ' ' + $dlInfo + ' (' + $i + '/' + $SodRepos.Count + ')')
   } else {
     $sodFail.Add($s.Folder) | Out-Null
@@ -1359,15 +1617,28 @@ foreach($s in $SodRepos){
 }
 Finish-Line
 if($sodSkip -gt 0){
-  Write-Host ('  ' + $sodSkip + ' of ' + $SodRepos.Count + ' SoD addons already up to date (skipped).') -ForegroundColor Gray
+  Write-Host ('  ' + $sodSkip + ' of ' + $SodRepos.Count + ' SoD addons verified up to date (md5 ok, skipped).') -ForegroundColor Gray
 }
 
-# Persist the incremental-update state (cf already merged above; sod now).
+# Persist SoD state: verified entries are kept, deleted keys are dropped and
+# fresh deployments are recorded with {etag, md5, folders}.
 $sodState = @{}
 if($deployState -and $deployState.sod){
-  foreach($p in $deployState.sod.PSObject.Properties){ $sodState[$p.Name] = $p.Value }
+  foreach($p in $deployState.sod.PSObject.Properties){
+    if(-not $dropSod.ContainsKey($p.Name)){ $sodState[$p.Name] = $p.Value }
+  }
 }
-foreach($k in $sodEtag.Keys){ $sodState[$k] = $sodEtag[$k] }
+$freshSod = @($SodRepos | Where-Object { $sodDl.ContainsKey($_.Folder) -and ($sodOk -contains $_.Folder) })
+$sodMd5 = @{}
+if($freshSod.Count -gt 0){
+  Write-Host ('  Computing md5 for ' + $freshSod.Count + ' newly deployed SoD addon(s) ...') -ForegroundColor Gray
+  $sodMd5 = Invoke-Md5Parallel (@($freshSod | ForEach-Object { @{ Key=$_.Folder; Folders=@($_.Folder) } }))
+}
+foreach($s in $freshSod){
+  $md5 = ''
+  if($sodMd5.ContainsKey($s.Folder)){ $md5 = $sodMd5[$s.Folder] }
+  $sodState[$s.Folder] = @{ etag = $sodEtag[$s.Folder]; md5 = $md5; folders = @($s.Folder) }
+}
 Write-DeployState @{ cf = $cfState; sod = $sodState }
 
 # ------------------------------- cleanup ------------------------------------
@@ -1392,6 +1663,13 @@ Write-Host ('  SoD addons OK   : ' + $sodOk.Count + '/' + $SodRepos.Count) -Fore
 if($sodFail.Count -gt 0){
   Write-Host (Truncate-Text ('  SoD FAILED      : ' + ($sodFail -join ', ')) $ConWidth) -ForegroundColor Red
 }
+$nOk  = $cfSkipOk.Count + $sodSkipOk.Count
+$nBad = $damaged.Count
+$nDel = $cfDelete.Count + $sodDelete.Count
+Write-Host ''
+Write-Host ('  ' + $SymOk + ' up to date (md5 ok)      : ' + $nOk) -ForegroundColor Green
+if($nBad -gt 0){ Write-Host ('  ' + $SymBad + ' damaged -> re-downloaded : ' + $nBad) -ForegroundColor Yellow }
+if($nDel -gt 0){ Write-Host ('  ' + $SymDel + ' deleted (removed from list): ' + $nDel) -ForegroundColor Red }
 Write-Host '  Downloaded zip files have been removed.' -ForegroundColor Gray
 Write-Host ('  Tip: delete ' + $StateFile + ' to force a full refresh.') -ForegroundColor Gray
 Write-Host ''
