@@ -17,9 +17,9 @@ exit /b %ERRORLEVEL%
 #    (Mainline - API compatible), then the newest release file.
 #    Projects without any Mainline/Forever build were removed from the list;
 #    see README.md for the kept/dropped table.
-#  - Own addons: the '*-SoD' repositories on GitHub are read from their
-#    'wow-forever' branch (the ported, mainline-API version of each addon).
-#    The Classic Era branches stay untouched on the same repositories.
+#  - Own addons: the dedicated '*-Forever' repositories on GitHub are the
+#    ported (mainline-API) versions of the original '*-SoD' addons. The SoD
+#    repositories themselves are never touched by this script.
 #  - Extracts everything into the 'AddOns' subfolder next to THIS script
 #    (put this script into '_forever_\Interface' and run it there).
 #  - After extraction every deployed addon gets a TOC check: a TOC whose
@@ -32,7 +32,7 @@ exit /b %ERRORLEVEL%
 #    1.60.x / 12.1.x / 12.0.x / 11.x.
 #  * CurseForge project list filtered to addons that exist for Forever or
 #    Mainline (classic-only addons dropped, see README).
-#  * GitHub addons are fetched from the 'wow-forever' branch.
+#  * GitHub addons are fetched from the dedicated '*-Forever' repositories.
 #  * TOC normalisation to interface 16001 after deploy.
 #  * Channel probing, slow-download guard, md5 incremental state and the
 #    Cloudflare fallback are unchanged.
@@ -101,16 +101,15 @@ $Projects = @(
   @{ Name = 'LoonBestInSlot';           Id = 570934  }
 )
 
-# Own addons from git repositories (repo name -> addon folder name).
-# Branch = 'wow-forever' points at the mainline-API port of the addon; the
-# 'main' branches keep the original Classic Era / SoD code untouched.
-# The wow-forever branches of BFGadgets/BiaoGe/bloodOfHeros/MYStats still
-# exist on GitHub - they are only removed from this deployment list.
-$SodRepos = @(
-  @{ Repo = 'RepairHelper-SoD';     Folder = 'RepairHelper';    Branch = 'wow-forever' },
-  @{ Repo = 'SellerHelper-SoD';     Folder = 'SellerHelper';    Branch = 'wow-forever' },
-  @{ Repo = 'TheBurningTrade-SoD';  Folder = 'TheBurningTrade'; Branch = 'wow-forever' },
-  @{ Repo = 'WhisperPop-SoD';       Folder = 'WhisperPop';      Branch = 'wow-forever' }
+# Own addons from the dedicated '*-Forever' repositories. The Forever port
+# lives in its own repository (mirroring the '*-SoD' naming), so the Classic
+# Era / Season of Discovery repositories stay completely untouched.
+# Each entry: repo name on GitHub -> addon folder name -> branch to fetch.
+$OwnRepos = @(
+  @{ Repo = 'RepairHelper-Forever';    Folder = 'RepairHelper';    Branch = 'main' },
+  @{ Repo = 'SellerHelper-Forever';    Folder = 'SellerHelper';    Branch = 'main' },
+  @{ Repo = 'TheBurningTrade-Forever'; Folder = 'TheBurningTrade'; Branch = 'main' },
+  @{ Repo = 'WhisperPop-Forever';      Folder = 'WhisperPop';      Branch = 'main' }
 )
 
 # ------------------------------- helpers ------------------------------------
@@ -708,7 +707,7 @@ Write-Host ('   World of Warcraft: Forever - AddOns one-click deploy') -Foregrou
 Write-Host $HLine -ForegroundColor Cyan
 Write-Host (Truncate-Text ('  Target directory : ' + $DeployDir) $ConWidth)
 Write-Host ('  CurseForge addons: ' + $Projects.Count + ' projects')
-Write-Host ('  Own Forever addons: ' + $SodRepos.Count + ' repositories')
+Write-Host ('  Own Forever addons: ' + $OwnRepos.Count + ' repositories')
 Write-Host ''
 
 $checkDir = $ScriptDir
@@ -904,24 +903,24 @@ if($coreFail.Count -gt 0){
 #   verify    - remote version matches state: check local md5 (cores - 2 threads)
 #   delete    - entry tracked in state but no longer in the download lists
 Write-Host ''
-Write-Host ('  Classifying ' + ($Projects.Count + $SodRepos.Count) + ' managed addons ...') -ForegroundColor Green
+Write-Host ('  Classifying ' + ($Projects.Count + $OwnRepos.Count) + ' managed addons ...') -ForegroundColor Green
 $deployState = Read-DeployState
 
 # Remote SoD versions (codeload ETag) are resolved up front so the same
 # download/verify/delete decision can be made for GitHub-sourced addons.
 $sodRemote = @{}
-if($SodRepos.Count -gt 0){
+if($OwnRepos.Count -gt 0){
   $si = 0
-  foreach($s in $SodRepos){
+  foreach($s in $OwnRepos){
     $si++
-    Show-Bar ($si / $SodRepos.Count) ('HEAD codeload ' + $s.Folder + ' (' + $si + '/' + $SodRepos.Count + ')')
+    Show-Bar ($si / $OwnRepos.Count) ('HEAD codeload ' + $s.Folder + ' (' + $si + '/' + $OwnRepos.Count + ')')
     $sodRemote[$s.Folder] = Get-CodeloadEtag ('https://codeload.github.com/' + $GhUser + '/' + $s.Repo + '/zip/refs/heads/' + $s.Branch) @()
   }
   Finish-Line
 }
 
 $currentCf  = @{}; foreach($p in $Projects){ $currentCf[$p.Name] = $true }
-$currentSod = @{}; foreach($s in $SodRepos){ $currentSod[$s.Folder] = $true }
+$currentSod = @{}; foreach($s in $OwnRepos){ $currentSod[$s.Folder] = $true }
 
 $toVerify     = New-Object System.Collections.Generic.List[object] # @{Kind;Key;Folders;Md5;Ref}
 $toDownloadCf = New-Object System.Collections.Generic.List[object]
@@ -956,7 +955,7 @@ if($deployState -and $deployState.cf){
 }
 
 # ---- SoD entries ------------------------------------------------------------
-foreach($s in $SodRepos){
+foreach($s in $OwnRepos){
   $raw = $null
   if($deployState -and $deployState.sod){ $raw = $deployState.sod.($s.Folder) }
   $e = Read-SodStateEntry $raw
@@ -1034,7 +1033,7 @@ foreach($r in $resolved){
   }
 }
 foreach($d in $cfDelete){ Add-PlanLine $SymDel 'Red' $d.Key 'no longer in list' ''; $dropCf[$d.Key] = $true }
-foreach($s in $SodRepos){
+foreach($s in $OwnRepos){
   # GitHub side has no zip name: show the codeload commit hash (first 7 chars).
   $gh = ''
   $et = $sodRemote[$s.Folder]
@@ -1583,8 +1582,8 @@ foreach($r in $freshCf){
 # ------------------------ phase 5: own Forever addons -----------------------
 # The ported addons are ALWAYS downloaded from GitHub (source archive zip),
 # so the script works identically on any machine - no local git workspace
-# is used. The wow-forever branch of each repo carries the mainline-API
-# port; 'main'/'master' are only fallbacks.
+# is used. Each '*-Forever' repository carries the mainline-API port;
+# 'main'/'master' are tried in that order.
 # Sources per repo/branch, in order:
 #   1. codeload.github.com/.../zip/...      (direct, no redirect - fastest)
 #   2. github.com/.../archive/...zip        (302 -> codeload)
@@ -1601,8 +1600,8 @@ $sodEtag = @{}
 # for GitHub too. Without a proxy, plain direct is used (codeload is directly
 # reachable).
 $GhArgs = @()
-if($ChProxy -and $SodRepos.Count -gt 0){
-  $ghProbeUrl = 'https://codeload.github.com/' + $GhUser + '/' + $SodRepos[0].Repo + '/zip/refs/heads/' + $SodRepos[0].Branch
+if($ChProxy -and $OwnRepos.Count -gt 0){
+  $ghProbeUrl = 'https://codeload.github.com/' + $GhUser + '/' + $OwnRepos[0].Repo + '/zip/refs/heads/' + $OwnRepos[0].Branch
   $candidates = @()
   $candidates += @{ Id='PROXY'; Args=@('--proxy',$ChProxy); Label='proxy ' + $ChProxy }
   $candidates += @{ Id='DIRECT'; Args=@(); Label='direct' }
@@ -1619,16 +1618,16 @@ if($ChProxy -and $SodRepos.Count -gt 0){
 }
 
 $i = 0
-foreach($s in $SodRepos){
+foreach($s in $OwnRepos){
   $i++
   # Verified-intact repos (md5 ok in the integrity phase) are not downloaded.
   if($sodSkipOk.ContainsKey($s.Folder)){
     $sodOk.Add($s.Folder) | Out-Null
     $sodSkip++
-    Show-Bar ($i / $SodRepos.Count) ('up to date: ' + $s.Folder + ' (' + $i + '/' + $SodRepos.Count + ')')
+    Show-Bar ($i / $OwnRepos.Count) ('up to date: ' + $s.Folder + ' (' + $i + '/' + $OwnRepos.Count + ')')
     continue
   }
-  Show-Bar (($i - 1) / $SodRepos.Count) ('downloading ' + $s.Folder + ' (' + $i + '/' + $SodRepos.Count + ')')
+  Show-Bar (($i - 1) / $OwnRepos.Count) ('downloading ' + $s.Folder + ' (' + $i + '/' + $OwnRepos.Count + ')')
   $target = Join-Path $DeployDir $s.Folder
   $done   = $false
   $dlInfo = ''
@@ -1687,19 +1686,19 @@ foreach($s in $SodRepos){
       # HEAD failed during planning; fetch it now so the state has an etag.
       $sodEtag[$s.Folder] = Get-CodeloadEtag ('https://codeload.github.com/' + $GhUser + '/' + $s.Repo + '/zip/refs/heads/' + $s.Branch) $GhArgs
     }
-    Show-Bar ($i / $SodRepos.Count) ('OK: ' + $s.Folder + ' ' + $dlInfo + ' (' + $i + '/' + $SodRepos.Count + ')')
+    Show-Bar ($i / $OwnRepos.Count) ('OK: ' + $s.Folder + ' ' + $dlInfo + ' (' + $i + '/' + $OwnRepos.Count + ')')
   } else {
     $sodFail.Add($s.Folder) | Out-Null
-    Show-Bar ($i / $SodRepos.Count) ('FAILED: ' + $s.Folder + ' (' + $i + '/' + $SodRepos.Count + ')')
+    Show-Bar ($i / $OwnRepos.Count) ('FAILED: ' + $s.Folder + ' (' + $i + '/' + $OwnRepos.Count + ')')
   }
 }
 Finish-Line
 if($sodSkip -gt 0){
-  Write-Host ('  ' + $sodSkip + ' of ' + $SodRepos.Count + ' own addons verified up to date (md5 ok, skipped).') -ForegroundColor Gray
+  Write-Host ('  ' + $sodSkip + ' of ' + $OwnRepos.Count + ' own addons verified up to date (md5 ok, skipped).') -ForegroundColor Gray
 }
 
 # TOC normalisation for the freshly deployed GitHub addons (before md5).
-$tocSod = @($SodRepos | Where-Object { $sodDl.ContainsKey($_.Folder) -and ($sodOk -contains $_.Folder) })
+$tocSod = @($OwnRepos | Where-Object { $sodDl.ContainsKey($_.Folder) -and ($sodOk -contains $_.Folder) })
 if($tocSod.Count -gt 0){
   foreach($s in $tocSod){ Repair-ForeverToc (Join-Path $DeployDir $s.Folder) }
   if($script:TocWarn.Count -gt 0){
@@ -1715,7 +1714,7 @@ if($deployState -and $deployState.sod){
     if(-not $dropSod.ContainsKey($p.Name)){ $sodState[$p.Name] = $p.Value }
   }
 }
-$freshSod = @($SodRepos | Where-Object { $sodDl.ContainsKey($_.Folder) -and ($sodOk -contains $_.Folder) })
+$freshSod = @($OwnRepos | Where-Object { $sodDl.ContainsKey($_.Folder) -and ($sodOk -contains $_.Folder) })
 $sodMd5 = @{}
 if($freshSod.Count -gt 0){
   Write-Host ('  Computing md5 for ' + $freshSod.Count + ' newly deployed SoD addon(s) ...') -ForegroundColor Gray
@@ -1746,7 +1745,7 @@ if($resolveFail.Count -gt 0){
 if($dlFailed.Count -gt 0){
   Write-Host (Truncate-Text ('  Download FAILED : ' + ($dlFailed -join ', ')) $ConWidth) -ForegroundColor Red
 }
-Write-Host ('  Own addons OK   : ' + $sodOk.Count + '/' + $SodRepos.Count) -ForegroundColor Green
+Write-Host ('  Own addons OK   : ' + $sodOk.Count + '/' + $OwnRepos.Count) -ForegroundColor Green
 if($sodFail.Count -gt 0){
   Write-Host (Truncate-Text ('  Own addons FAIL : ' + ($sodFail -join ', ')) $ConWidth) -ForegroundColor Red
 }

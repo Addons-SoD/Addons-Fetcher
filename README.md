@@ -91,30 +91,31 @@ publish a 1.60.1 file.
 
 ## Own GitHub addons (ported to the modern API)
 
-The `*-SoD` repositories got a `wow-forever` branch with the addon code
-ported from the Classic Era API to the Forever/Mainline API. The deployer
-always fetches that branch.
+Every ported addon lives in its own `*-Forever` repository (mirroring the
+existing `*-SoD` naming). The deployer always fetches the `main` branch of
+those repositories, so the Classic Era / Season of Discovery repositories
+are never referenced and their addon state is never touched.
 
 Deployed by default (4):
 
 | Addon | Repository |
 | --- | --- |
-| RepairHelper | [RepairHelper-SoD](https://github.com/Addons-SoD/RepairHelper-SoD) |
-| SellerHelper | [SellerHelper-SoD](https://github.com/Addons-SoD/SellerHelper-SoD) |
-| TheBurningTrade | [TheBurningTrade-SoD](https://github.com/Addons-SoD/TheBurningTrade-SoD) |
-| WhisperPop | [WhisperPop-SoD](https://github.com/Addons-SoD/WhisperPop-SoD) |
+| RepairHelper | [RepairHelper-Forever](https://github.com/Addons-SoD/RepairHelper-Forever) |
+| SellerHelper | [SellerHelper-Forever](https://github.com/Addons-SoD/SellerHelper-Forever) |
+| TheBurningTrade | [TheBurningTrade-Forever](https://github.com/Addons-SoD/TheBurningTrade-Forever) |
+| WhisperPop | [WhisperPop-Forever](https://github.com/Addons-SoD/WhisperPop-Forever) |
 
-Ported but removed from the deployment list on request (the `wow-forever`
-branches stay on GitHub, add the entries back to `$SodRepos` to deploy them):
+Additional ports kept as `wow-forever` branches on their `*-SoD` repositories
+(not deployed here, not part of this addon set):
 
-| Addon | Repository |
+| Addon | Repository / branch |
 | --- | --- |
-| BFGadgets | [BFGadgets-SoD](https://github.com/Addons-SoD/BFGadgets-SoD) |
-| BiaoGe | [BiaoGe-SoD](https://github.com/Addons-SoD/BiaoGe-SoD) |
-| bloodOfHeros | [bloodOfHeros-SoD](https://github.com/Addons-SoD/bloodOfHeros-SoD) |
-| MYStats | [MYStats-SoD](https://github.com/Addons-SoD/MYStats-SoD) |
+| BFGadgets | `Addons-SoD/BFGadgets-SoD`, branch `wow-forever` |
+| BiaoGe | `Addons-SoD/BiaoGe-SoD`, branch `wow-forever` |
+| bloodOfHeros | `Addons-SoD/bloodOfHeros-SoD`, branch `wow-forever` |
+| MYStats | `Addons-SoD/MYStats-SoD`, branch `wow-forever` |
 
-Porting rules applied to those branches:
+Porting rules applied to those addons:
 
 - TOC `## Interface: 16001`.
 - Removed globals replaced with `C_` APIs: `GetSpellInfo` ->
