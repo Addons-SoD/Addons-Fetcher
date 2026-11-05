@@ -676,7 +676,14 @@ function Repair-ForeverToc([string]$dir){
   try{
     $latin1 = [Text.Encoding]::GetEncoding(28591)
     $bytes  = [IO.File]::ReadAllBytes($toc)
-    $text   = $latin1.GetString($bytes)
+    # Keep a UTF-8 BOM out of the regex match, re-attach it on write.
+    $bom = New-Object byte[] 0
+    $off = 0
+    if($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF){
+      $bom = @($bytes[0], $bytes[1], $bytes[2])
+      $off = 3
+    }
+    $text = $latin1.GetString($bytes, $off, $bytes.Length - $off)
     $m = [regex]::Match($text, '(?m)^##[ \t]*Interface:[^\r\n]*')
     if(-not $m.Success){
       $script:TocWarn.Add($name + ' (no Interface line)') | Out-Null
@@ -685,7 +692,11 @@ function Repair-ForeverToc([string]$dir){
     if($m.Value -match '16001'){ return }   # already Forever-ready
     $newLine = $m.Value.TrimEnd() + ', 16001'
     $out = $text.Substring(0, $m.Index) + $newLine + $text.Substring($m.Index + $m.Length)
-    [IO.File]::WriteAllBytes($toc, $latin1.GetBytes($out))
+    $body = $latin1.GetBytes($out)
+    $all  = New-Object byte[] ($bom.Length + $body.Length)
+    if($bom.Length -gt 0){ [Array]::Copy([byte[]]$bom, 0, $all, 0, $bom.Length) }
+    [Array]::Copy($body, 0, $all, $bom.Length, $body.Length)
+    [IO.File]::WriteAllBytes($toc, $all)
     $script:TocChanged.Add($name) | Out-Null
   }catch{
     $script:TocWarn.Add($name + ' (' + $_.Exception.Message + ')') | Out-Null
