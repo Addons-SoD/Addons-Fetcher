@@ -1,43 +1,41 @@
 @echo off
-title Addons-Fetcher - WoW Classic Era AddOns One-Click Deploy
+title Addons-Fetcher (WoW Forever) - AddOns One-Click Deploy
 chcp 65001 >nul
 cd /d "%~dp0"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$env:DEPLOY_SELF='%~f0'; $env:DEPLOY_DIR='%~dp0'; $c=[IO.File]::ReadAllText('%~f0',[Text.Encoding]::UTF8); $m=([char]10).ToString()+'#PS'+'START'; $i=$c.IndexOf($m); if($i -lt 0){ Write-Host 'Script marker not found.'; exit 1 }; Invoke-Expression ($c.Substring($i+$m.Length))"
 exit /b %ERRORLEVEL%
 #PSSTART
 # ============================================================================
-#  WoW Classic Era - AddOns one-click deployment script  (v3)
-#  - Downloads all CurseForge addons listed below (latest Classic Era file)
-#  - Downloads the *-SoD addons from GitHub (source archive zip; works on
-#    any machine, no local git workspace required)
+#  WoW Forever - AddOns one-click deployment script  (v4-forever)
+#
+#  Target game: World of Warcraft: Forever ("Warcraft Forever"), client
+#  folder '_forever_', product flavor 'wowf', addon interface 16001.
+#  Forever runs the modern Mainline UI family (~12.1.5 API), NOT Classic Era.
+#
+#  - CurseForge: every project in $Projects is resolved to the newest file
+#    that supports 1.60.x (native Forever), then 12.1.x / 12.0.x / 11.x
+#    (Mainline - API compatible), then the newest release file.
+#    Projects without any Mainline/Forever build were removed from the list;
+#    see README.md for the kept/dropped table.
+#  - Own addons: the '*-SoD' repositories on GitHub are read from their
+#    'wow-forever' branch (the ported, mainline-API version of each addon).
+#    The Classic Era branches stay untouched on the same repositories.
 #  - Extracts everything into the 'AddOns' subfolder next to THIS script
-#    (put this script into the 'Interface' folder and run it there)
-#  - Deletes all downloaded zip files when finished
-#  v3 changes:
-#  * SoD addons are always fetched from GitHub (github.com archive ->
-#    codeload direct -> api.github.com tarball), with a proxy-vs-direct
-#    channel probe when a proxy is available.
-#  * Slow-download guard: a transfer averaging below 50 KB/s is killed and
-#    retried on another channel; after 3 slow kills the CDN channels are
-#    re-probed and the fastest one is picked again.
-#  * The progress bar now shows the live overall throughput (MB/s).
-#  * Extraction parallelism = logical CPU cores - 2 (min 1).
-#  v2 changes:
-#  * Smart channel selection: detects the Windows system proxy, enumerates
-#    multiple CDN IPs (system DNS + AliDNS), speed-tests every candidate in
-#    parallel and uses the fastest one. No proxy required - a proxy is only
-#    used when the system has one AND it proves faster than direct links.
-#    The chosen channel is cached for 30 minutes ('.addons-fetcher-cache.json'
-#    next to this script).
-#  * Phase 1 metadata lookups run in parallel (x8 curl processes).
-#  * Extraction uses tar.exe with 4 parallel workers (fallback: Expand-Archive).
-#  Notes:
-#  - Metadata lookups use the official CurseForge Core API
-#    (api.curseforge.com) with the API key of the locally installed
-#    CurseForge app.
-#  - If the Core API is unavailable, the script falls back to scraping
-#    www.curseforge.com with the Windows native Schannel HTTP stack.
-#  - Bulk downloads go straight to the ForgeCDN mirror.
+#    (put this script into '_forever_\Interface' and run it there).
+#  - After extraction every deployed addon gets a TOC check: a TOC whose
+#    '## Interface:' does not list 16001 gets 16001 added, so Forever does
+#    not flag the addon as out of date. Files are never otherwise edited.
+#  - Deletes all downloaded zip files when finished.
+#
+#  v4 changes vs. the SoD script:
+#  * Version picking switched from 1.15.x/1.14.x/1.13.x to
+#    1.60.x / 12.1.x / 12.0.x / 11.x.
+#  * CurseForge project list filtered to addons that exist for Forever or
+#    Mainline (classic-only addons dropped, see README).
+#  * GitHub addons are fetched from the 'wow-forever' branch.
+#  * TOC normalisation to interface 16001 after deploy.
+#  * Channel probing, slow-download guard, md5 incremental state and the
+#    Cloudflare fallback are unchanged.
 # ============================================================================
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
@@ -71,63 +69,51 @@ $CfHeaders = @{
   'Accept-Language' = 'en-US,en;q=0.9'
 }
 $CoreHeaders = @{ 'x-api-key' = $CfApiKey; 'Accept' = 'application/json' }
-# CurseForge projects: display name -> numeric CurseForge project id
+# CurseForge projects kept for WoW Forever: display name -> numeric project id.
+# Every entry has a Forever (1.60.x) or Mainline (12.1.x / 12.0.x / 11.x)
+# build on CurseForge. Classic-only addons from the SoD list were dropped -
+# the full keep/drop table is in README.md.
 $Projects = @(
-  @{ Name = 'AtlasLootClassic';         Id = 1180455 },
   @{ Name = 'Auctionator';              Id = 6124    },
   @{ Name = 'AutoFlood';                Id = 21367   },
   @{ Name = 'Baganator';                Id = 914482  },
   @{ Name = 'BigWigs';                  Id = 2382    },
-  @{ Name = 'BigWigs_Classic';          Id = 50625   },
   @{ Name = 'BigWigs_Transcriptor';     Id = 53389   },
   @{ Name = 'BlizzMove';                Id = 17809   },
   @{ Name = 'BugGrabber';               Id = 13344   },
   @{ Name = 'BugSack';                  Id = 6273    },
-  @{ Name = 'CharacterStatsClassic';    Id = 338856  },
   @{ Name = 'Decursive';                Id = 2154    },
   @{ Name = 'Details';                  Id = 61284   },
-  @{ Name = 'DruidBarClassic';          Id = 334762  },
-  @{ Name = 'ExtendedCharacterStats';   Id = 334877  },
-  @{ Name = 'GatherMate2';              Id = 405809  },
   @{ Name = 'idTip';                    Id = 24541   },
   @{ Name = 'Leatrix_Maps';             Id = 298842  },
-  @{ Name = 'LiteButtonAuras';          Id = 526431  },
   @{ Name = 'MessageQueue';             Id = 358350  },
   @{ Name = 'MinimapButtonButton';      Id = 446096  },
   @{ Name = 'Myslot';                   Id = 48863   },
-  @{ Name = 'NovaWorldBuffs';           Id = 366310  },
   @{ Name = 'Profession_Assistance';    Id = 65085   },
   @{ Name = 'Questie';                  Id = 334372  },
   @{ Name = 'RangeDisplay';             Id = 14570   },
   @{ Name = 'RareScanner';              Id = 84208   },
   @{ Name = 'SpellActivationOverlay';   Id = 649417  },
-  @{ Name = 'Spy';                      Id = 323123  },
   @{ Name = 'Syndicator';               Id = 988370  },
   @{ Name = 'ThreatClassic2';           Id = 355497  },
   @{ Name = 'TotemTimers';              Id = 339602  },
   @{ Name = 'Transcriptor';             Id = 14837   },
-  @{ Name = 'WeakAuras';                Id = 65387   },
-  @{ Name = 'WeWantBlueShamans';        Id = 962536  },
-  @{ Name = 'alaGearMan';               Id = 347869  },
-  @{ Name = 'alaTradeSkill';            Id = 380889  },
-  @{ Name = 'Ranker';                   Id = 907755  },
-  @{ Name = 'RuneReminderReforged';     Id = 1640798 },
-  @{ Name = 'TalentEmuX';               Id = 338706  },
-  @{ Name = 'GatherMate2_Data';         Id = 350035  },
   @{ Name = '_DebugLog';                Id = 382165  },
   @{ Name = 'LoonBestInSlot';           Id = 570934  }
 )
 
-# Own SoD addons from git repositories (repo name -> addon folder name)
+# Own addons from git repositories (repo name -> addon folder name).
+# Branch = 'wow-forever' points at the mainline-API port of the addon; the
+# 'main' branches keep the original Classic Era / SoD code untouched.
 $SodRepos = @(
-  @{ Repo = 'BFGadgets-SoD';        Folder = 'BFGadgets'       },
-  @{ Repo = 'BiaoGe-SoD';           Folder = 'BiaoGe'          },
-  @{ Repo = 'bloodOfHeros-SoD';     Folder = 'bloodOfHeros'    },
-  @{ Repo = 'MYStats-SoD';          Folder = 'MYStats'         },
-  @{ Repo = 'RepairHelper-SoD';     Folder = 'RepairHelper'    },
-  @{ Repo = 'SellerHelper-SoD';     Folder = 'SellerHelper'    },
-  @{ Repo = 'TheBurningTrade-SoD';  Folder = 'TheBurningTrade' },
-  @{ Repo = 'WhisperPop-SoD';       Folder = 'WhisperPop'      }
+  @{ Repo = 'BFGadgets-SoD';        Folder = 'BFGadgets';       Branch = 'wow-forever' },
+  @{ Repo = 'BiaoGe-SoD';           Folder = 'BiaoGe';          Branch = 'wow-forever' },
+  @{ Repo = 'bloodOfHeros-SoD';     Folder = 'bloodOfHeros';    Branch = 'wow-forever' },
+  @{ Repo = 'MYStats-SoD';          Folder = 'MYStats';         Branch = 'wow-forever' },
+  @{ Repo = 'RepairHelper-SoD';     Folder = 'RepairHelper';    Branch = 'wow-forever' },
+  @{ Repo = 'SellerHelper-SoD';     Folder = 'SellerHelper';    Branch = 'wow-forever' },
+  @{ Repo = 'TheBurningTrade-SoD';  Folder = 'TheBurningTrade'; Branch = 'wow-forever' },
+  @{ Repo = 'WhisperPop-SoD';       Folder = 'WhisperPop';      Branch = 'wow-forever' }
 )
 
 # ------------------------------- helpers ------------------------------------
@@ -421,15 +407,16 @@ function Get-CodeloadEtag($url,[string[]]$extraArgs){
 }
 
 # Pick the newest file for a project from a parsed /files JSON (page 1).
-# Prefers, in order: release channel files matching 1.15.x, then 1.14.x,
-# then 1.13.x, then simply the newest release-channel file.
+# Prefers, in order: release-channel files matching 1.60.x (native WoW
+# Forever), then 12.1.x, 12.0.x and 11.x (Mainline - the API family Forever
+# is built on), then simply the newest release-channel file.
 function Select-FileFromJson($j){
   if($null -eq $j -or $null -eq $j.data){ return $null }
   $files = @($j.data)
   if($files.Count -eq 0){ return $null }
   $rel = @($files | Where-Object { $_.releaseType -eq 1 })
   if($rel.Count -eq 0){ $rel = $files }
-  foreach($pref in '^1\.15','^1\.14','^1\.13'){
+  foreach($pref in '^1\.60','^12\.1','^12\.0','^11\.'){
     $hit = @($rel | Where-Object { $f = $_; @($f.gameVersions | Where-Object { $_ -match $pref }).Count -gt 0 } | Select-Object -First 1)
     if($hit.Count -gt 0){ return $hit[0] }
   }
@@ -503,7 +490,7 @@ function Resolve-ProjectCore($projId){
     if($files.Count -eq 0){ break }
     foreach($f in $files){ $all.Add($f) | Out-Null }
     $rel = @($files | Where-Object { $_.releaseType -eq 1 })
-    $hit = @($rel | Where-Object { $f = $_; @($f.gameVersions | Where-Object { $_ -match '^1\.15' }).Count -gt 0 } | Select-Object -First 1)
+    $hit = @($rel | Where-Object { $f = $_; @($f.gameVersions | Where-Object { $_ -match '^1\.60' }).Count -gt 0 } | Select-Object -First 1)
     if($hit.Count -gt 0){ return $hit[0] }
     if($files.Count -lt 50){ break }
     Start-Sleep -Milliseconds 50
@@ -511,7 +498,7 @@ function Resolve-ProjectCore($projId){
   if($all.Count -eq 0){ return $null }
   $rel = @($all | Where-Object { $_.releaseType -eq 1 })
   if($rel.Count -eq 0){ $rel = $all.ToArray() }
-  foreach($pref in '^1\.15','^1\.14','^1\.13'){
+  foreach($pref in '^1\.60','^12\.1','^12\.0','^11\.'){
     $hit = @($rel | Where-Object { $f = $_; @($f.gameVersions | Where-Object { $_ -match $pref }).Count -gt 0 } | Sort-Object -Property @{Expression={$_.fileDate};Descending=$true} | Select-Object -First 1)
     if($hit.Count -gt 0){ return $hit[0] }
   }
@@ -526,7 +513,7 @@ function Resolve-Project($projId){
   if($files.Count -eq 0){ return $null }
   $rel = @($files | Where-Object { $_.releaseType -eq 1 })
   if($rel.Count -eq 0){ $rel = $files }
-  foreach($pref in '^1\.15','^1\.14','^1\.13'){
+  foreach($pref in '^1\.60','^12\.1','^12\.0','^11\.'){
     $hit = $rel | Where-Object { $f = $_; @($f.gameVersions | Where-Object { $_ -match $pref }).Count -gt 0 } | Select-Object -First 1
     if($hit){ return $hit }
   }
@@ -656,15 +643,64 @@ function Remove-EntryFolders($folders){
   }
 }
 
+# --------------------- TOC normalisation (interface 16001) -------------------
+# WoW Forever speaks interface 16001. An addon shipped for 12.x/11.x still
+# loads, but the client flags it "out of date" and skips it unless outdated
+# addons are enabled - so every freshly deployed addon gets 16001 added to
+# the '## Interface:' line of the TOC the client will pick. The edit is done
+# byte-for-byte through a Latin-1 round-trip, so neither the rest of the TOC
+# nor its original encoding is touched.
+$script:TocChanged = New-Object System.Collections.Generic.List[string]
+$script:TocWarn    = New-Object System.Collections.Generic.List[string]
+
+# The TOC the client picks for this folder: <Name>.toc first, then the
+# Forever flavour suffix, then the Mainline one.
+function Get-ForeverToc([string]$dir){
+  $name = Split-Path -Leaf $dir
+  foreach($c in @(
+      (Join-Path $dir ($name + '.toc')),
+      (Join-Path $dir ($name + '_Camelot.toc')),
+      (Join-Path $dir ($name + '_Mainline.toc'))
+    )){
+    if(Test-Path -LiteralPath $c){ return $c }
+  }
+  return $null
+}
+
+# Make sure the main TOC of $dir lists 16001. Idempotent; failures are
+# collected as warnings and never abort the deployment.
+function Repair-ForeverToc([string]$dir){
+  $name = Split-Path -Leaf $dir
+  $toc  = Get-ForeverToc $dir
+  if(-not $toc){ $script:TocWarn.Add($name + ' (no TOC)') | Out-Null; return }
+  try{
+    $latin1 = [Text.Encoding]::GetEncoding(28591)
+    $bytes  = [IO.File]::ReadAllBytes($toc)
+    $text   = $latin1.GetString($bytes)
+    $m = [regex]::Match($text, '(?m)^##[ \t]*Interface:[^\r\n]*')
+    if(-not $m.Success){
+      $script:TocWarn.Add($name + ' (no Interface line)') | Out-Null
+      return
+    }
+    if($m.Value -match '16001'){ return }   # already Forever-ready
+    $newLine = $m.Value.TrimEnd() + ', 16001'
+    $out = $text.Substring(0, $m.Index) + $newLine + $text.Substring($m.Index + $m.Length)
+    [IO.File]::WriteAllBytes($toc, $latin1.GetBytes($out))
+    $script:TocChanged.Add($name) | Out-Null
+  }catch{
+    $script:TocWarn.Add($name + ' (' + $_.Exception.Message + ')') | Out-Null
+  }
+}
+
 # ------------------------------ pre-checks ----------------------------------
 Init-ConsoleMode
 Write-Host ''
 Write-Host $HLine -ForegroundColor Cyan
-Write-Host ('   World of Warcraft Classic Era - AddOns one-click deploy') -ForegroundColor Cyan
+Write-Host ('   World of Warcraft: Forever - AddOns one-click deploy') -ForegroundColor Cyan
 Write-Host $HLine -ForegroundColor Cyan
 Write-Host (Truncate-Text ('  Target directory : ' + $DeployDir) $ConWidth)
 Write-Host ('  CurseForge addons: ' + $Projects.Count + ' projects')
-Write-Host ('  Own SoD addons   : ' + $SodRepos.Count + ' repositories')
+Write-Host ('  Own Forever addons: ' + $SodRepos.Count + ' repositories')
 Write-Host ''
 
 $checkDir = $ScriptDir
@@ -698,7 +734,7 @@ New-Item -ItemType Directory -Force -Path $DlDir | Out-Null
 
 # --------------------- phase 1: resolve latest files (parallel) -------------
 Write-Host ''
-Write-Host ('[1/5] Resolving latest Classic Era files on CurseForge (parallel x' + $Concurrency + ') ...') -ForegroundColor Green
+Write-Host ('[1/5] Resolving latest Forever/Mainline files on CurseForge (parallel x' + $Concurrency + ') ...') -ForegroundColor Green
 $resolved     = New-Object System.Collections.Generic.List[object]
 $resolveFail  = New-Object System.Collections.Generic.List[string]
 $coreFail     = New-Object System.Collections.Generic.List[object]
@@ -1497,6 +1533,23 @@ while($tarQueue.Count -gt 0 -or $tActive.Count -gt 0){
 }
 Finish-Line
 
+# TOC normalisation for the freshly extracted CurseForge addons. It runs
+# BEFORE the md5 snapshot so a later run sees the patched files as intact.
+$tocCf = @($resolved | Where-Object { $_.Plan -eq 'download' -and ($extractOk -contains $_.Name) -and @($_.Folders).Count -gt 0 })
+if($tocCf.Count -gt 0){
+  Write-Host ''
+  Write-Host ('[4b] Normalising TOC interface (16001) for ' + $tocCf.Count + ' addon(s) ...') -ForegroundColor Green
+  foreach($r in $tocCf){ foreach($fd in @($r.Folders)){ Repair-ForeverToc (Join-Path $DeployDir $fd) } }
+  if($script:TocChanged.Count -gt 0){
+    $shown = @($script:TocChanged | Select-Object -First 8) -join ', '
+    if($script:TocChanged.Count -gt 8){ $shown += ' ...' }
+    Write-Host (Truncate-Text ('  interface 16001 added: ' + $shown) $ConWidth) -ForegroundColor Gray
+  }
+  if($script:TocWarn.Count -gt 0){
+    Write-Host (Truncate-Text ('  TOC warnings: ' + ($script:TocWarn -join '; ')) $ConWidth) -ForegroundColor Yellow
+  }
+}
+
 # Record CurseForge state for the next run: freshly deployed entries get
 # {fileId, md5, folders}; verified-skip entries keep their stored object;
 # deleted keys (no longer in the list) and damaged-then-redeployed keys are
@@ -1519,15 +1572,17 @@ foreach($r in $freshCf){
   $cfState[$r.Name] = @{ fileId = [string]$r.FileId; md5 = $md5; folders = @($r.Folders) }
 }
 
-# ------------------------- phase 5: own SoD addons --------------------------
-# The *-SoD addons are ALWAYS downloaded from GitHub (source archive zip),
+# ------------------------ phase 5: own Forever addons -----------------------
+# The ported addons are ALWAYS downloaded from GitHub (source archive zip),
 # so the script works identically on any machine - no local git workspace
-# is used. Sources per repo/branch, in order:
+# is used. The wow-forever branch of each repo carries the mainline-API
+# port; 'main'/'master' are only fallbacks.
+# Sources per repo/branch, in order:
 #   1. codeload.github.com/.../zip/...      (direct, no redirect - fastest)
 #   2. github.com/.../archive/...zip        (302 -> codeload)
 #   3. api.github.com/.../tarball/...       (tar.gz fallback)
 Write-Host ''
-Write-Host '[5/5] Downloading own SoD addons from GitHub ...' -ForegroundColor Green
+Write-Host '[5/5] Downloading own Forever addons from GitHub ...' -ForegroundColor Green
 $sodOk   = New-Object System.Collections.Generic.List[string]
 $sodFail = New-Object System.Collections.Generic.List[string]
 $sodSkip = 0
@@ -1539,7 +1594,7 @@ $sodEtag = @{}
 # reachable).
 $GhArgs = @()
 if($ChProxy -and $SodRepos.Count -gt 0){
-  $ghProbeUrl = 'https://codeload.github.com/' + $GhUser + '/' + $SodRepos[0].Repo + '/zip/refs/heads/main'
+  $ghProbeUrl = 'https://codeload.github.com/' + $GhUser + '/' + $SodRepos[0].Repo + '/zip/refs/heads/' + $SodRepos[0].Branch
   $candidates = @()
   $candidates += @{ Id='PROXY'; Args=@('--proxy',$ChProxy); Label='proxy ' + $ChProxy }
   $candidates += @{ Id='DIRECT'; Args=@(); Label='direct' }
@@ -1569,7 +1624,8 @@ foreach($s in $SodRepos){
   $target = Join-Path $DeployDir $s.Folder
   $done   = $false
   $dlInfo = ''
-  foreach($branch in 'main','master'){
+  $branches = @($s.Branch, 'main', 'master') | Where-Object { $_ } | Select-Object -Unique
+  foreach($branch in $branches){
     $zip = Join-Path $DlDir ($s.Repo + '-' + $branch + '.zip')
     $urls = @(
       ('https://codeload.github.com/' + $GhUser + '/' + $s.Repo + '/zip/refs/heads/' + $branch),
@@ -1621,7 +1677,7 @@ foreach($s in $SodRepos){
     $sodEtag[$s.Folder] = $sodEtagPlan[$s.Folder]
     if(-not $sodEtag[$s.Folder]){
       # HEAD failed during planning; fetch it now so the state has an etag.
-      $sodEtag[$s.Folder] = Get-CodeloadEtag ('https://codeload.github.com/' + $GhUser + '/' + $s.Repo + '/zip/refs/heads/main') $GhArgs
+      $sodEtag[$s.Folder] = Get-CodeloadEtag ('https://codeload.github.com/' + $GhUser + '/' + $s.Repo + '/zip/refs/heads/' + $s.Branch) $GhArgs
     }
     Show-Bar ($i / $SodRepos.Count) ('OK: ' + $s.Folder + ' ' + $dlInfo + ' (' + $i + '/' + $SodRepos.Count + ')')
   } else {
@@ -1631,7 +1687,16 @@ foreach($s in $SodRepos){
 }
 Finish-Line
 if($sodSkip -gt 0){
-  Write-Host ('  ' + $sodSkip + ' of ' + $SodRepos.Count + ' SoD addons verified up to date (md5 ok, skipped).') -ForegroundColor Gray
+  Write-Host ('  ' + $sodSkip + ' of ' + $SodRepos.Count + ' own addons verified up to date (md5 ok, skipped).') -ForegroundColor Gray
+}
+
+# TOC normalisation for the freshly deployed GitHub addons (before md5).
+$tocSod = @($SodRepos | Where-Object { $sodDl.ContainsKey($_.Folder) -and ($sodOk -contains $_.Folder) })
+if($tocSod.Count -gt 0){
+  foreach($s in $tocSod){ Repair-ForeverToc (Join-Path $DeployDir $s.Folder) }
+  if($script:TocWarn.Count -gt 0){
+    Write-Host (Truncate-Text ('  TOC warnings: ' + ($script:TocWarn -join '; ')) $ConWidth) -ForegroundColor Yellow
+  }
 }
 
 # Persist SoD state: verified entries are kept, deleted keys are dropped and
@@ -1673,9 +1738,9 @@ if($resolveFail.Count -gt 0){
 if($dlFailed.Count -gt 0){
   Write-Host (Truncate-Text ('  Download FAILED : ' + ($dlFailed -join ', ')) $ConWidth) -ForegroundColor Red
 }
-Write-Host ('  SoD addons OK   : ' + $sodOk.Count + '/' + $SodRepos.Count) -ForegroundColor Green
+Write-Host ('  Own addons OK   : ' + $sodOk.Count + '/' + $SodRepos.Count) -ForegroundColor Green
 if($sodFail.Count -gt 0){
-  Write-Host (Truncate-Text ('  SoD FAILED      : ' + ($sodFail -join ', ')) $ConWidth) -ForegroundColor Red
+  Write-Host (Truncate-Text ('  Own addons FAIL : ' + ($sodFail -join ', ')) $ConWidth) -ForegroundColor Red
 }
 $nOk  = $cfSkipOk.Count + $sodSkipOk.Count
 $nBad = $damaged.Count
