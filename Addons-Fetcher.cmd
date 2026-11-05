@@ -73,6 +73,7 @@ $CoreHeaders = @{ 'x-api-key' = $CfApiKey; 'Accept' = 'application/json' }
 # Every entry has a Forever (1.60.x) or Mainline (12.1.x / 12.0.x / 11.x)
 # build on CurseForge. Classic-only addons from the SoD list were dropped -
 # the full keep/drop table is in README.md.
+# Note: Details and Leatrix_Maps were intentionally removed from the set.
 $Projects = @(
   @{ Name = 'Auctionator';              Id = 6124    },
   @{ Name = 'AutoFlood';                Id = 21367   },
@@ -83,9 +84,7 @@ $Projects = @(
   @{ Name = 'BugGrabber';               Id = 13344   },
   @{ Name = 'BugSack';                  Id = 6273    },
   @{ Name = 'Decursive';                Id = 2154    },
-  @{ Name = 'Details';                  Id = 61284   },
   @{ Name = 'idTip';                    Id = 24541   },
-  @{ Name = 'Leatrix_Maps';             Id = 298842  },
   @{ Name = 'MessageQueue';             Id = 358350  },
   @{ Name = 'MinimapButtonButton';      Id = 446096  },
   @{ Name = 'Myslot';                   Id = 48863   },
@@ -105,11 +104,9 @@ $Projects = @(
 # Own addons from git repositories (repo name -> addon folder name).
 # Branch = 'wow-forever' points at the mainline-API port of the addon; the
 # 'main' branches keep the original Classic Era / SoD code untouched.
+# The wow-forever branches of BFGadgets/BiaoGe/bloodOfHeros/MYStats still
+# exist on GitHub - they are only removed from this deployment list.
 $SodRepos = @(
-  @{ Repo = 'BFGadgets-SoD';        Folder = 'BFGadgets';       Branch = 'wow-forever' },
-  @{ Repo = 'BiaoGe-SoD';           Folder = 'BiaoGe';          Branch = 'wow-forever' },
-  @{ Repo = 'bloodOfHeros-SoD';     Folder = 'bloodOfHeros';    Branch = 'wow-forever' },
-  @{ Repo = 'MYStats-SoD';          Folder = 'MYStats';         Branch = 'wow-forever' },
   @{ Repo = 'RepairHelper-SoD';     Folder = 'RepairHelper';    Branch = 'wow-forever' },
   @{ Repo = 'SellerHelper-SoD';     Folder = 'SellerHelper';    Branch = 'wow-forever' },
   @{ Repo = 'TheBurningTrade-SoD';  Folder = 'TheBurningTrade'; Branch = 'wow-forever' },

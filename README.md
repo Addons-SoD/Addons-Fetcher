@@ -32,7 +32,7 @@ The Classic Era list was filtered against the CurseForge API: a project is
 kept only when it publishes a Forever (1.60.x) or Mainline (12.x/11.x) file.
 Everything else has no Forever counterpart and was removed.
 
-### Kept (26)
+### Kept (24)
 
 | Addon | Newest compatible file | Version family |
 | --- | --- | --- |
@@ -45,9 +45,7 @@ Everything else has no Forever counterpart and was removed.
 | BugGrabber | v12.1.1 | 1.60.1 |
 | BugSack | v12.1.9 | 1.60.1 |
 | Decursive | 2.9.0-RC4-forever | 1.60.1 |
-| Details | Details.20261104.15400.172 | 1.60.1 |
 | idTip | 12.1.8 | 1.60.1 |
-| Leatrix_Maps | 1.60.27-forever | 1.60.1 |
 | MessageQueue | MessageQueue 0.9.4 | 1.60.1 |
 | MinimapButtonButton | 1.24.15 | 1.60.1 |
 | Myslot | v6.2.1 | 1.60.1 |
@@ -63,17 +61,23 @@ Everything else has no Forever counterpart and was removed.
 | _DebugLog | 1.3.3 | 12.0.x (no 1.60 file) |
 | LoonBestInSlot | LoonBestInSlot-retail-v1.1.3 | 12.1.0 |
 
-### Dropped - no Forever counterpart (17)
+### Dropped (19)
+
+Addons without any Forever/Mainline build were dropped by the CurseForge
+filter. `Details` and `Leatrix_Maps` were removed on request even though they
+publish a 1.60.1 file.
 
 | Addon | Reason |
 | --- | --- |
 | AtlasLootClassic | files only for 1.15.x / 2.5.x, no Mainline build |
 | BigWigs_Classic | Classic Era / SoD content pack - BigWigs itself ships the Forever modules |
 | CharacterStatsClassic | Classic Era only |
+| Details | removed on request (has a 1.60.1 build) |
 | DruidBarClassic | Classic Era only |
 | ExtendedCharacterStats | TBC Classic only |
 | GatherMate2 | Classic/TBC/Mists only |
 | GatherMate2_Data | classic gathering data only (host addon is gone) |
+| Leatrix_Maps | removed on request (has a 1.60.1 build) |
 | LiteButtonAuras | Classic-era API only |
 | NovaWorldBuffs | Classic world-buff data only |
 | Spy | Classic Era only |
@@ -91,16 +95,24 @@ The `*-SoD` repositories got a `wow-forever` branch with the addon code
 ported from the Classic Era API to the Forever/Mainline API. The deployer
 always fetches that branch.
 
+Deployed by default (4):
+
+| Addon | Repository |
+| --- | --- |
+| RepairHelper | [RepairHelper-SoD](https://github.com/Addons-SoD/RepairHelper-SoD) |
+| SellerHelper | [SellerHelper-SoD](https://github.com/Addons-SoD/SellerHelper-SoD) |
+| TheBurningTrade | [TheBurningTrade-SoD](https://github.com/Addons-SoD/TheBurningTrade-SoD) |
+| WhisperPop | [WhisperPop-SoD](https://github.com/Addons-SoD/WhisperPop-SoD) |
+
+Ported but removed from the deployment list on request (the `wow-forever`
+branches stay on GitHub, add the entries back to `$SodRepos` to deploy them):
+
 | Addon | Repository |
 | --- | --- |
 | BFGadgets | [BFGadgets-SoD](https://github.com/Addons-SoD/BFGadgets-SoD) |
 | BiaoGe | [BiaoGe-SoD](https://github.com/Addons-SoD/BiaoGe-SoD) |
 | bloodOfHeros | [bloodOfHeros-SoD](https://github.com/Addons-SoD/bloodOfHeros-SoD) |
 | MYStats | [MYStats-SoD](https://github.com/Addons-SoD/MYStats-SoD) |
-| RepairHelper | [RepairHelper-SoD](https://github.com/Addons-SoD/RepairHelper-SoD) |
-| SellerHelper | [SellerHelper-SoD](https://github.com/Addons-SoD/SellerHelper-SoD) |
-| TheBurningTrade | [TheBurningTrade-SoD](https://github.com/Addons-SoD/TheBurningTrade-SoD) |
-| WhisperPop | [WhisperPop-SoD](https://github.com/Addons-SoD/WhisperPop-SoD) |
 
 Porting rules applied to those branches:
 
