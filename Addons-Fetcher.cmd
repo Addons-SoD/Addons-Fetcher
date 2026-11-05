@@ -918,7 +918,7 @@ if($SodRepos.Count -gt 0){
   foreach($s in $SodRepos){
     $si++
     Show-Bar ($si / $SodRepos.Count) ('HEAD codeload ' + $s.Folder + ' (' + $si + '/' + $SodRepos.Count + ')')
-    $sodRemote[$s.Folder] = Get-CodeloadEtag ('https://codeload.github.com/' + $GhUser + '/' + $s.Repo + '/zip/refs/heads/main') @()
+    $sodRemote[$s.Folder] = Get-CodeloadEtag ('https://codeload.github.com/' + $GhUser + '/' + $s.Repo + '/zip/refs/heads/' + $s.Branch) @()
   }
   Finish-Line
 }
