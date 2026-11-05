@@ -63,11 +63,12 @@ Everything else has no Forever counterpart and was removed.
 | _DebugLog | 1.3.3 | 12.0.x (no 1.60 file) |
 | LoonBestInSlot | LoonBestInSlot-retail-v1.1.3 | 12.1.0 |
 
-### Dropped - no Forever counterpart (16)
+### Dropped - no Forever counterpart (17)
 
 | Addon | Reason |
 | --- | --- |
 | AtlasLootClassic | files only for 1.15.x / 2.5.x, no Mainline build |
+| BigWigs_Classic | Classic Era / SoD content pack - BigWigs itself ships the Forever modules |
 | CharacterStatsClassic | Classic Era only |
 | DruidBarClassic | Classic Era only |
 | ExtendedCharacterStats | TBC Classic only |
